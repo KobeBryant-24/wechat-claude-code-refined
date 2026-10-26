@@ -20,7 +20,6 @@ import { loadConfig, saveConfig } from './config.js';
 import { logger } from './logger.js';
 import { DATA_DIR } from './constants.js';
 import { MessageType, type WeixinMessage } from './wechat/types.js';
-import { loadPendingQueue, savePendingQueue, type PendingItem } from './pending-queue.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -252,6 +251,16 @@ async function runDaemon(): Promise<void> {
   const api = new WeChatApi(account.botToken, account.baseUrl);
   const sessionStore = createSessionStore();
   const session: Session = sessionStore.load(account.accountId);
+  const sender = createSender(api, account.accountId);
+  // Restore any chunks/files that were persisted to disk by a previous
+  // daemon run. Each restored record is re-pushed onto the per-user queue
+  // with its original uuid — iLink's clientId dedup keeps the user from
+  // seeing duplicates when a chunk was already delivered but the delete
+  // didn't reach disk before the crash.
+  const restoredCount = sender.restorePending();
+  if (restoredCount > 0) {
+    logger.info('Restored pending messages on startup', { count: restoredCount });
+  }
 
   // Fix: backfill session workingDirectory from config if it's still the default process.cwd()
   if (config.workingDirectory && session.workingDirectory === process.cwd()) {
@@ -266,7 +275,6 @@ async function runDaemon(): Promise<void> {
     sessionStore.save(account.accountId, session);
   }
 
-  const sender = createSender(api, account.accountId);
   const sharedCtx = { lastContextToken: '' };
   const activeControllers = new Map<string, AbortController>();
 
@@ -277,6 +285,7 @@ async function runDaemon(): Promise<void> {
   async function drainQueue(): Promise<void> {
     if (processingQueue) return;
     processingQueue = true;
+    logger.info('drainQueue starting', { queueLength: messageQueue.length });
     while (messageQueue.length > 0) {
       const msg = messageQueue.shift()!;
       await handleMessage(msg, account!, session, sessionStore, sender, config, sharedCtx, activeControllers, messageQueue);
@@ -299,8 +308,18 @@ async function runDaemon(): Promise<void> {
     sessionStore.save(account!.accountId, session);
 
     if (text.startsWith('/stop')) {
+      const toUserId = msg.from_user_id!;
+      const contextToken = msg.context_token ?? '';
+      // Drop the backlog first, then let the user's message refill the
+      // budget. The order matters: /stop is most often sent *because* the
+      // budget ran out, so without the refill the acknowledgement below
+      // would be queued behind a spent budget and never arrive.
+      sender.clearQueue(toUserId, contextToken);  // drop unsent chunks
+      sender.stopTyping(toUserId, contextToken);  // cancel typing keepalive
       messageQueue.length = 0;
-      sender.sendText(msg.from_user_id!, msg.context_token ?? '', '⏹ 已停止当前对话，排队中的消息已清空。').catch(() => {});
+      sender.noteInbound(toUserId, contextToken);
+      // Fire-and-forget acknowledgement — queued for delivery by worker.
+      sender.enqueuePriority(toUserId, contextToken, '⏹ 已停止当前对话，排队中的消息已清空。', 'final');
     }
     return true;
   }
@@ -360,9 +379,11 @@ async function handleMessage(
   const fromUserId = msg.from_user_id;
   sharedCtx.lastContextToken = contextToken;
 
-  // Flush any pending messages from prior rate-limit windows. User's new
-  // message brings a fresh context_token, which resets the iLink 11-msg quota.
-  await flushPending(account.accountId, fromUserId, contextToken, sender);
+  // A message from the user refills their outbound budget: the counter
+  // restarts, the circuit breaker closes, and the previous turn's backlog
+  // becomes sendable again. This is also what makes /continue work — the
+  // stashed messages go out as soon as the user writes again.
+  flushPending(fromUserId, contextToken, sender);
 
   // Extract text from items
   const userText = extractTextFromItems(msg.item_list);
@@ -371,6 +392,11 @@ async function handleMessage(
 
   // Drop non-command messages while processing (priority commands already handled upstream)
   if (session.state === 'processing' && !userText.startsWith('/')) {
+    logger.warn('handleMessage dropped: session still processing', {
+      message_id: msg.message_id,
+      userText: userText.slice(0, 80),
+      hint: 'previous sendToClaude may have crashed mid-turn — see finally block',
+    });
     return;
   }
 
@@ -388,13 +414,22 @@ async function handleMessage(
       updateSession,
       clearSession: () => sessionStore.clear(account.accountId),
       getChatHistoryText: (limit?: number) => sessionStore.getChatHistoryText(session, limit),
+      getPendingCount: () => sender.pendingCount(fromUserId),
       text: userText,
     };
 
     const result: CommandResult = routeCommand(ctx);
 
     if (result.handled && result.reply) {
-      await sender.sendText(fromUserId, contextToken, result.reply);
+      sessionStore.addChatMessage(session, 'assistant', result.reply);
+      sessionStore.save(account.accountId, session);
+      // A priority reply jumps the backlog: the user asked a question and is
+      // waiting for the answer, not for the tail of the previous turn.
+      if (result.priority) {
+        sender.enqueuePriority(fromUserId, contextToken, result.reply, 'final');
+      } else {
+        sender.enqueue(fromUserId, contextToken, result.reply, 'final');
+      }
       return;
     }
 
@@ -407,7 +442,7 @@ async function handleMessage(
     }
 
     if (result.handled && result.sendFile) {
-      await sender.sendFile(fromUserId, contextToken, result.sendFile);
+      sender.enqueueFile(fromUserId, contextToken, result.sendFile);
       return;
     }
 
@@ -419,7 +454,7 @@ async function handleMessage(
   // -- Normal message -> Claude --
 
   if (!userText && !imageItem && !fileItem) {
-    await sender.sendText(fromUserId, contextToken, '暂不支持此类型消息，请发送文字、语音、图片或文件');
+    sender.enqueue(fromUserId, contextToken, '暂不支持此类型消息，请发送文字、语音、图片或文件', 'final');
     return;
   }
 
@@ -434,48 +469,27 @@ function extractTextFromItems(items: NonNullable<WeixinMessage['item_list']>): s
 }
 
 /**
- * Drain the pending message queue (messages that couldn't be delivered in a
- * prior rate-limit window). Called whenever a fresh user message arrives with
- * a new context_token. Each flush attempt stops at the first failure —
- * remaining items stay queued for the next user message.
+ * React to a new user message from this user.
+ *
+ * The message refills the user's outbound budget, so the counter restarts,
+ * the circuit breaker closes, and whatever is still queued from the previous
+ * turn becomes sendable again. Queued messages are re-stamped with the new
+ * context token on the way — the one they carry may have gone stale while
+ * they waited, and a stale token is rejected by the server in exactly the
+ * same way an exhausted quota is.
+ *
+ * This used to drain `pending-queue.ts`, a disk file that nothing ever
+ * wrote to (`appendPending` had no callers), so the file was always empty
+ * and the "pending flushed on next user message" comment described a
+ * mechanism that did not exist. The real backlog is the sender's in-memory
+ * per-user queue plus the durable per-chunk records in `pending-store.ts`.
  */
-async function flushPending(
-  accountId: string,
+function flushPending(
   toUserId: string,
   contextToken: string,
   sender: ReturnType<typeof createSender>,
-): Promise<void> {
-  const queue = loadPendingQueue(accountId);
-  if (queue.length === 0) return;
-
-  logger.info('Flushing pending queue', { accountId, pending: queue.length });
-  const stillPending: PendingItem[] = [];
-
-  for (const item of queue) {
-    try {
-      const chunks = splitMessage(item.text);
-      for (const chunk of chunks) {
-        await sender.sendText(toUserId, contextToken, chunk);
-      }
-    } catch (err) {
-      logger.warn('Flush stopped at rate-limit, keeping remaining items queued', {
-        accountId,
-        flushed: queue.length - stillPending.length - 1,
-        remaining: stillPending.length + 1,
-        error: err instanceof Error ? err.message : String(err),
-      });
-      stillPending.push(item);
-    }
-  }
-
-  savePendingQueue(accountId, stillPending);
-
-  if (stillPending.length > 0 && stillPending.length === queue.length) {
-    // Nothing got flushed this round — nudge the user.
-    await sender
-      .sendText(toUserId, contextToken, `⏳ 还有 ${stillPending.length} 条暂存消息未能推送，再发任意消息我会继续补发。`)
-      .catch(() => {});
-  }
+): void {
+  sender.noteInbound(toUserId, contextToken);
 }
 
 async function sendToClaude(
@@ -640,68 +654,11 @@ async function sendToClaude(
       Object.assign(result, retryResult);
     }
 
-    // Stop periodic flush, drain router (final 先于 interstitial), wait for queued sends
-    clearInterval(flushTimer);
+    // Stop periodic flush, drain router (final 先于 interstitial). Per-user
+    // worker in sender keeps running until the queue drains — no need to
+    // await here because the next emission (or user message) will land in
+    // the same per-user queue, preserving order.
     router.drain();
-    await flushChain;
-
-    // 兜底重试：drain() 的最后一次发送若失败，pendingRetry 会卡住没有下一个 emit 接力。
-    // 这里做有上限的终态重试，避免静默丢内容（commit d6d7d62 的 "never silently drop" 保证）。
-    const MAX_TERMINAL_ATTEMPTS = 3;
-    let terminalAttempt = 0;
-    while (pendingRetry && terminalAttempt < MAX_TERMINAL_ATTEMPTS) {
-      const stuck: { text: string; role: 'interstitial' | 'final' } = pendingRetry;
-      pendingRetry = null;
-      terminalAttempt++;
-      const delayMs = terminalAttempt * 5_000;  // 5s, 10s, 15s
-      logger.warn(`terminal retry ${terminalAttempt}/${MAX_TERMINAL_ATTEMPTS} for stranded content`, {
-        role: stuck.role,
-        delayMs,
-        textLength: stuck.text.length,
-      });
-      await new Promise(r => setTimeout(r, delayMs));
-
-      const chunks = splitMessage(stuck.text);
-      let failed = false;
-      for (let i = 0; i < chunks.length; i++) {
-        try {
-          await sender.sendText(fromUserId, contextToken, chunks[i]);
-          anySent = true;
-          lastSentTime = Date.now();
-        } catch (err) {
-          pendingRetry = { text: chunks.slice(i).join('\n\n'), role: stuck.role };
-          logger.warn('terminal retry failed', {
-            attempt: terminalAttempt,
-            error: err instanceof Error ? err.message : String(err),
-          });
-          failed = true;
-          break;
-        }
-      }
-      if (!failed) break;
-    }
-
-    if (pendingRetry) {
-      // Park the stranded content to the pending queue. It will be flushed
-      // automatically when the user's next message brings a fresh context_token
-      // (which resets the iLink 11-msg quota).
-      const queue = loadPendingQueue(account.accountId);
-      queue.push({
-        text: pendingRetry.text,
-        role: pendingRetry.role,
-        queuedAt: Date.now(),
-      });
-      savePendingQueue(account.accountId, queue);
-      logger.warn('content parked to pending queue', {
-        role: pendingRetry.role,
-        textLength: pendingRetry.text.length,
-        queueSize: queue.length,
-      });
-      await sender
-        .sendText(fromUserId, contextToken, '⏳ 部分内容因微信单次推送上限暂存，下次你回复任意消息时自动补发。')
-        .catch(() => {});
-      pendingRetry = null;
-    }
 
     // Send result back to WeChat
     if (result.text) {
@@ -728,50 +685,24 @@ async function sendToClaude(
     session.state = 'idle';
     sessionStore.save(account.accountId, session);
 
-    // Auto-push deliverable files mentioned in Claude's response
-    if (result.text) {
-      const cwd = (session.workingDirectory || config.workingDirectory).replace(/^~/, homedir());
-      const detectedPaths = extractFilePathsFromText(result.text, cwd);
-      const { existsSync } = await import('node:fs');
-      const { extname } = await import('node:path');
-      const pushable = detectedPaths.filter(f => {
-        const ext = extname(f).toLowerCase();
-        return AUTO_PUSH_EXTENSIONS.has(ext) && existsSync(f);
-      });
-      if (pushable.length > 0) {
-        const failedFiles: string[] = [];
-        for (const filePath of pushable) {
-          try {
-            await sender.sendFile(fromUserId, contextToken, filePath);
-          } catch {
-            failedFiles.push(filePath);
-          }
-        }
-        if (failedFiles.length > 0) {
-          // Server-side rate limit requires longer cooldown (observed ret:-2 even after 9s backoff)
-          for (let attempt = 0; attempt < 3; attempt++) {
-            const delay = (attempt + 1) * 15_000;
-            logger.warn(`Rate-limited, retrying ${failedFiles.length} file(s) in ${delay / 1000}s (attempt ${attempt + 1}/3)`);
-            await new Promise(r => setTimeout(r, delay));
-            const stillFailed: string[] = [];
-            for (const filePath of failedFiles) {
-              try {
-                await sender.sendFile(fromUserId, contextToken, filePath);
-              } catch {
-                stillFailed.push(filePath);
-              }
-            }
-            if (stillFailed.length === 0) break;
-            failedFiles.length = 0;
-            failedFiles.push(...stillFailed);
-          }
-          if (failedFiles.length > 0) {
-            logger.error('File delivery failed after all retries', { files: failedFiles });
-            await sender.sendText(fromUserId, contextToken, `文件推送失败（服务端限频），请稍后重试。`).catch(() => {});
-          }
-        }
-      }
+
+    // Auto-push deliverable files mentioned in Claude's response. Each file goes
+  // through the per-user worker queue so circuit-breaker and pacing are honored
+  // without any caller-side coordination. The old 15s exponential retry block
+  // is gone — the worker handles retriable failures itself.
+  if (result.text) {
+    const cwd = (session.workingDirectory || config.workingDirectory).replace(/^~/, homedir());
+    const detectedPaths = extractFilePathsFromText(result.text, cwd);
+    const { existsSync } = await import('node:fs');
+    const { extname } = await import('node:path');
+    const pushable = detectedPaths.filter(f => {
+      const ext = extname(f).toLowerCase();
+      return AUTO_PUSH_EXTENSIONS.has(ext) && existsSync(f);
+    });
+    for (const filePath of pushable) {
+      sender.enqueueFile(fromUserId, contextToken, filePath);
     }
+  }
   } catch (err) {
     const isAbort = err instanceof Error && (err.name === 'AbortError' || err.message.includes('abort'));
     if (isAbort) {
@@ -780,12 +711,11 @@ async function sendToClaude(
     } else {
       const errorMsg = err instanceof Error ? err.message : String(err);
       logger.error('Error in sendToClaude', { error: errorMsg });
-      await sender.sendText(fromUserId, contextToken, '处理消息时出错，请稍后重试。');
+      sender.enqueue(fromUserId, contextToken, '处理消息时出错，请稍后重试。', 'final');
     }
     session.state = 'idle';
     sessionStore.save(account.accountId, session);
   } finally {
-    clearInterval(flushTimer);
     stopTyping();
     // Clean up the abort controller if it's still ours
     if (activeControllers.get(account.accountId) === abortController) {

@@ -54,7 +54,7 @@ export function invalidateSkillCache(): void {
 }
 
 export function handleHelp(_args: string): CommandResult {
-  return { reply: HELP_TEXT, handled: true };
+  return { reply: HELP_TEXT, handled: true, priority: true };
 }
 
 export function handleClear(ctx: CommandContext): CommandResult {
@@ -81,6 +81,7 @@ export function handleModel(ctx: CommandContext, args: string): CommandResult {
 
 export function handleStatus(ctx: CommandContext): CommandResult {
   const s = ctx.session;
+  const pending = ctx.getPendingCount?.() ?? 0;
   const lines = [
     '📊 会话状态',
     '',
@@ -88,8 +89,9 @@ export function handleStatus(ctx: CommandContext): CommandResult {
     `模型: ${s.model ?? '默认'}`,
     `会话ID: ${s.sdkSessionId ?? '无'}`,
     `状态: ${s.state}`,
+    `待发消息: ${pending}${pending > 0 ? '（额度用完时在排队，回复任意消息即可续发）' : ''}`,
   ];
-  return { reply: lines.join('\n'), handled: true };
+  return { reply: lines.join('\n'), handled: true, priority: true };
 }
 
 export function handleSkills(args: string): CommandResult {
@@ -102,10 +104,10 @@ export function handleSkills(args: string): CommandResult {
   const showFull = args.trim().toLowerCase() === 'full';
   if (showFull) {
     const lines = skills.map(s => `/${s.name}\n   ${s.description}`);
-    return { reply: `📋 已安装的 Skill (${skills.length}):\n\n${lines.join('\n\n')}`, handled: true };
+    return { reply: `📋 已安装的 Skill (${skills.length}):\n\n${lines.join('\n\n')}`, handled: true, priority: true };
   }
   const lines = skills.map(s => `/${s.name}`);
-  return { reply: `📋 已安装的 Skill (${skills.length}):\n\n${lines.join('\n')}\n\n使用 /skills full 查看完整描述`, handled: true };
+  return { reply: `📋 已安装的 Skill (${skills.length}):\n\n${lines.join('\n')}\n\n使用 /skills full 查看完整描述`, handled: true, priority: true };
 }
 
 const MAX_HISTORY_LIMIT = 100;
@@ -168,11 +170,22 @@ export function handleVersion(): CommandResult {
     const __dirname = fileURLToPath(new URL('.', import.meta.url));
     const pkg = JSON.parse(readFileSync(join(__dirname, '..', '..', 'package.json'), 'utf-8'));
     const version = pkg.version || 'unknown';
-    return { reply: `wechat-claude-code v${version}`, handled: true };
+    return { reply: `wechat-claude-code v${version}`, handled: true, priority: true };
   } catch {
-    return { reply: 'wechat-claude-code (version unknown)', handled: true };
+    return { reply: 'wechat-claude-code (version unknown)', handled: true, priority: true };
   }
 }
+/**
+ * `/stop` when nothing is running.
+ *
+ * The interesting case — a turn in flight — never reaches here: the daemon
+ * intercepts it before the message enters the serial queue, so it takes
+ * effect immediately instead of waiting for the current turn to finish.
+ */
+export function handleStop(_ctx: CommandContext): CommandResult {
+  return { reply: 'ℹ️ 当前没有进行中的对话。', handled: true, priority: true };
+}
+
 
 export function handlePrompt(_ctx: CommandContext, args: string): CommandResult {
   const config = loadConfig();

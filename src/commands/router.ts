@@ -9,6 +9,11 @@ export interface CommandContext {
   updateSession: (partial: Partial<Session>) => void;
   clearSession: () => Session;
   getChatHistoryText?: (limit?: number) => string;
+  /**
+   * How many messages are still queued for this user, waiting on the
+   * outbound budget. Lets `/status` show what is stuck and why.
+   */
+  getPendingCount?: () => number;
   text: string;
 }
 
@@ -17,6 +22,15 @@ export interface CommandResult {
   handled: boolean;
   claudePrompt?: string;
   sendFile?: string; // Absolute path to a file to send to the user
+  /**
+   * Deliver this reply ahead of whatever is still queued for the user.
+   *
+   * A command reply is the user waiting for an answer to a question they
+   * just asked. If the previous turn left a backlog, the reply would be
+   * queued behind it — and a backlog can be long enough to eat the whole
+   * turn's budget, leaving the reply undeliverable.
+   */
+  priority?: boolean;
 }
 
 /**
