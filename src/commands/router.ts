@@ -14,6 +14,13 @@ export interface CommandContext {
    * outbound budget. Lets `/status` show what is stuck and why.
    */
   getPendingCount?: () => number;
+  /**
+   * The session currently being watched by `/notify-me`, if any.
+   *
+   * The watch lives in a service-level component, not in the session
+   * record, so the caller supplies it.
+   */
+  getNotifyWatch?: () => { sessionId: string; registeredAt: number; busy: boolean } | undefined;
   text: string;
 }
 
@@ -41,6 +48,16 @@ export interface CommandResult {
    * turn's budget, leaving the reply undeliverable.
    */
   priority?: boolean;
+  /**
+   * Register, replace, or cancel the service-level session watch.
+   *
+   * The caller runs it — the watch needs the sender, the transcript
+   * lookup, and the persistent store, none of which the command context
+   * carries.
+   */
+  notifyAction?:
+    | { kind: 'register'; sessionId: string; transcriptPath: string }
+    | { kind: 'cancel' };
 }
 
 /**

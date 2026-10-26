@@ -3,7 +3,8 @@ import { scanAllSkills, formatSkillList, findSkill, type SkillInfo } from '../cl
 import { loadConfig, saveConfig } from '../config.js';
 import { DEFAULT_WORKING_DIR } from '../constants.js';
 import { readSnippet, snippetPath, isValidSnippetId } from '../claude/snippet-store.js';
-import { readFileSync, existsSync, statSync } from 'node:fs';
+import { shortSessionId } from '../claude/session-watcher.js';
+import { readFileSync, existsSync, statSync, readdirSync, openSync, readSync, closeSync } from 'node:fs';
 import { resolve, basename, join } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -17,6 +18,8 @@ const HELP_TEXT = `可用命令：
   /clear            清除当前会话
   /reset            完全重置（包括工作目录等设置）
   /status           查看当前会话状态
+  /notify-me <会话ID>  监控该会话，本轮完成时微信通知我
+  /notify-me off    取消会话监控
   /compact          压缩上下文（开始新 SDK 会话，保留历史）
   /history [数量]   查看对话记录（默认最近20条）
   /undo [数量]      撤销最近对话（默认1条）
@@ -67,6 +70,83 @@ export function handleClear(ctx: CommandContext): CommandResult {
   return { reply: '✅ 会话已清除，下次消息将开始新会话。', handled: true };
 }
 
+type SessionLookup =
+  | { kind: 'found'; projectDir: string; sessionPath: string; fullId: string }
+  | { kind: 'ambiguous'; matches: string[] }
+  | { kind: 'missing' };
+
+/**
+ * Resolve a user-supplied session reference to a real transcript on disk.
+ *
+ * `id` may be a full UUID or ANY unique prefix of one. Prefix support is not
+ * a nicety: `listSdkSessions` only ever shows `shortId` (first 8 chars), so
+ * the short form is what users copy out of the listing and type back.
+ *
+ * Exact matching alone silently broke that round-trip. The old
+ * `handleSession` bound whatever the user typed, so `/session e2100b43`
+ * stored `e2100b43` as `sdkSessionId`, and the next message spawned
+ * `claude --resume e2100b43` — which Claude rejects ("is not a UUID and does
+ * not match any session title"). The daemon then fell back to a fresh session
+ * on every turn while the state table claimed a resume was configured.
+ */
+function findSessionFile(id: string): SessionLookup {
+  const projectsDir = join(homedir(), '.claude', 'projects');
+  if (!existsSync(projectsDir)) return { kind: 'missing' };
+
+  let projectDirs: string[];
+  try {
+    projectDirs = readdirSync(projectsDir);
+  } catch {
+    return { kind: 'missing' };
+  }
+
+  // Exact match first — cheap, and the common case for a pasted UUID.
+  for (const projectDir of projectDirs) {
+    const candidate = join(projectsDir, projectDir, `${id}.jsonl`);
+    if (existsSync(candidate)) {
+      return { kind: 'found', projectDir, sessionPath: candidate, fullId: id };
+    }
+  }
+
+  // Prefix sweep across every project dir. Transcripts sit directly in the
+  // project dir; subagent sidecars live under <sessionId>/subagents/, so
+  // readdir of the project dir never picks those up.
+  const needle = id.toLowerCase();
+  const matches: Array<{ fullId: string; sessionPath: string }> = [];
+  for (const projectDir of projectDirs) {
+    let files: string[];
+    try {
+      files = readdirSync(join(projectsDir, projectDir));
+    } catch {
+      continue;
+    }
+    for (const file of files) {
+      if (!file.endsWith('.jsonl')) continue;
+      const fullId = file.slice(0, -'.jsonl'.length);
+      if (fullId.toLowerCase().startsWith(needle)) {
+        matches.push({ fullId, sessionPath: join(projectsDir, projectDir, file) });
+      }
+    }
+  }
+
+  if (matches.length === 1) {
+    return {
+      kind: 'found',
+      projectDir: '',
+      sessionPath: matches[0].sessionPath,
+      fullId: matches[0].fullId,
+    };
+  }
+  if (matches.length > 1) {
+    // Don't guess. Sorted so the reply is stable across runs.
+    return { kind: 'ambiguous', matches: matches.map((m) => m.fullId).sort() };
+  }
+  return { kind: 'missing' };
+}
+function shortId(id: string): string {
+  // The one definition of "the short session id" — see shortSessionId.
+  return shortSessionId(id);
+}
 export function handleCwd(ctx: CommandContext, args: string): CommandResult {
   if (!args) {
     return { reply: `当前工作目录: ${ctx.session.workingDirectory}\n用法: /cwd <路径>`, handled: true };
@@ -87,6 +167,7 @@ export function handleStatus(ctx: CommandContext): CommandResult {
   const s = ctx.session;
   const pending = ctx.getPendingCount?.() ?? 0;
   const compact = s.compactMsg ?? loadConfig().compactMsg ?? false;
+  const watched = ctx.getNotifyWatch?.();
   const lines = [
     '📊 会话状态',
     '',
@@ -95,6 +176,7 @@ export function handleStatus(ctx: CommandContext): CommandResult {
     `会话ID: ${s.sdkSessionId ?? '无'}`,
     `状态: ${s.state}`,
     `整合消息: ${compact ? '开启' : '关闭'}`,
+    `监控会话: ${watched ? `${shortId(watched.sessionId)}（${watched.busy ? '运行中' : '空闲'}）` : '无'}`,
     `待发消息: ${pending}${pending > 0 ? '（额度用完时在排队，回复任意消息即可续发）' : ''}`,
   ];
   return { reply: lines.join('\n'), handled: true, priority: true };
@@ -293,6 +375,79 @@ export function handleContinue(ctx: CommandContext, _args: string): CommandResul
   return { handled: true, continueSession: true };
 }
 
+/**
+ * `/notify-me <session-id>` — ping me when that session finishes its turn.
+ *
+ * The watched session is a Claude Code session, identified the way
+ * `/session` identifies one: the full id, or any unique prefix of it. The
+ * 8-character id in the `/session` listing is what users actually copy.
+ *
+ * Only one session is watched at a time. Registering a new one replaces
+ * the old — the user is pointing the watch at whatever they are waiting
+ * for now, and a second silent watch would be a way to forget the first.
+ *
+ * The watch itself is a service-level component (it keeps running while
+ * the user is not talking), so the command only decides *what* to watch;
+ * the caller does the registering.
+ */
+export function handleNotifyMe(ctx: CommandContext, args: string): CommandResult {
+  const arg = args.trim();
+
+  if (!arg) {
+    const watched = ctx.getNotifyWatch?.();
+    if (!watched) {
+      return {
+        reply: '🔕 当前没有正在监控的会话\n\n' +
+          '用法: /notify-me <会话ID>\n' +
+          '（会话ID 见 /session 列表的 ID 列）\n' +
+          '取消: /notify-me off',
+        handled: true,
+        priority: true,
+      };
+    }
+    return {
+      reply: `🔔 正在监控会话 ${shortId(watched.sessionId)}\n` +
+        `状态: ${watched.busy ? '该会话正在运行中，等待本轮结束' : '该会话当前空闲，等待下一个任务完成'}\n` +
+        `注册时间: ${new Date(watched.registeredAt).toLocaleString('zh-CN')}\n\n` +
+        '取消: /notify-me off',
+      handled: true,
+      priority: true,
+    };
+  }
+
+  if (arg === 'off' || arg === 'cancel' || arg === 'stop') {
+    return { handled: true, notifyAction: { kind: 'cancel' } };
+  }
+
+  const lookup = findSessionFile(arg);
+  if (lookup.kind === 'ambiguous') {
+    const shown = lookup.matches.slice(0, 5).map((m) => `  · ${m}`).join('\n');
+    return {
+      reply: `⚠️ "${arg}" 同时匹配 ${lookup.matches.length} 个会话，未开始监控：\n${shown}\n` +
+        '请补长前缀（能唯一确定一个），或用 /session 重新看列表。',
+      handled: true,
+      priority: true,
+    };
+  }
+
+  if (lookup.kind === 'missing') {
+    return {
+      reply: `⚠️ 找不到会话 ${arg}\n` +
+        '用 /session 查看可用的会话列表。',
+      handled: true,
+      priority: true,
+    };
+  }
+
+  return {
+    handled: true,
+    notifyAction: {
+      kind: 'register',
+      sessionId: lookup.fullId,
+      transcriptPath: lookup.sessionPath,
+    },
+  };
+}
 
 export function handlePrompt(_ctx: CommandContext, args: string): CommandResult {
   const config = loadConfig();

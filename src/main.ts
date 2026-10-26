@@ -2,7 +2,7 @@ import { createInterface } from 'node:readline';
 import process from 'node:process';
 import { spawnSync } from 'node:child_process';
 import { join, basename } from 'node:path';
-import { unlinkSync, writeFileSync, mkdirSync } from 'node:fs';
+import { unlinkSync, writeFileSync, mkdirSync, statSync, openSync, readSync, closeSync, existsSync, readdirSync, readFileSync, appendFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 
 import { WeChatApi } from './wechat/api.js';
@@ -17,6 +17,7 @@ import { claudeQuery, type QueryOptions } from './claude/provider.js';
 import { TurnRouter } from './claude/turn-router.js';
 import { cleanupExpiredSnippets } from './claude/snippet-store.js';
 import { createNormalSink, createCompactSink, type TurnSink, type SinkOptions } from './claude/turn-sink.js';
+import { createSessionWatcher, shortSessionId } from './claude/session-watcher.js';
 import { loadConfig, saveConfig, type Config } from './config.js';
 import { logger } from './logger.js';
 import { DATA_DIR } from './constants.js';
@@ -187,6 +188,14 @@ async function runDaemon(): Promise<void> {
   const sessionStore = createSessionStore();
   const session: Session = sessionStore.load(account.accountId);
   const sender = createSender(api, account.accountId);
+  // Service-level session watch (`/notify-me`). It polls the transcript of
+  // the Claude Code session the user pointed it at and pushes a WeChat
+  // notification when that session finishes its turn. It deliberately
+  // outlives the conversation: the user registers a watch, walks away, and
+  // gets pinged when the work lands. The watch is persisted, so a daemon
+  // restart does not lose it.
+  const sessionWatcher = createSessionWatcher({ sender });
+  sessionWatcher.start();
   // Restore any chunks/files that were persisted to disk by a previous
   // daemon run. Each restored record is re-pushed onto the per-user queue
   // with its original uuid — iLink's clientId dedup keeps the user from
@@ -223,7 +232,7 @@ async function runDaemon(): Promise<void> {
     logger.info('drainQueue starting', { queueLength: messageQueue.length });
     while (messageQueue.length > 0) {
       const msg = messageQueue.shift()!;
-      await handleMessage(msg, account!, session, sessionStore, sender, config, sharedCtx, activeControllers, messageQueue);
+      await handleMessage(msg, account!, session, sessionStore, sender, config, sharedCtx, activeControllers, messageQueue, sessionWatcher);
     }
     processingQueue = false;
   }
@@ -253,6 +262,7 @@ async function runDaemon(): Promise<void> {
       sender.stopTyping(toUserId, contextToken);  // cancel typing keepalive
       messageQueue.length = 0;
       sender.noteInbound(toUserId, contextToken);
+      sessionWatcher.noteInbound(toUserId, contextToken);
       // Fire-and-forget acknowledgement — queued for delivery by worker.
       sender.enqueuePriority(toUserId, contextToken, '⏹ 已停止当前对话，排队中的消息已清空。', 'final');
     }
@@ -316,6 +326,7 @@ async function handleMessage(
   sharedCtx: { lastContextToken: string },
   activeControllers: Map<string, AbortController>,
   messageQueue: WeixinMessage[],
+  sessionWatcher: ReturnType<typeof createSessionWatcher>,
 ): Promise<void> {
   // Filter: only user messages with required fields
   if (msg.message_type !== MessageType.USER) return;
@@ -331,6 +342,11 @@ async function handleMessage(
   // becomes sendable again. This is also what makes /continue work — the
   // stashed messages go out as soon as the user writes again.
   flushPending(fromUserId, contextToken, sender);
+  // The watch's notification goes out with a context token. Tokens go
+  // stale, and a stale token is rejected by the server exactly like an
+  // exhausted quota — so the newest one is worth keeping, in case the
+  // notification fires long after this message.
+  sessionWatcher.noteInbound(fromUserId, contextToken);
 
   // Extract text from items
   const userText = extractTextFromItems(msg.item_list);
@@ -365,6 +381,7 @@ async function handleMessage(
       clearSession: () => sessionStore.clear(account.accountId, session),
       getChatHistoryText: (limit?: number) => sessionStore.getChatHistoryText(session, limit),
       getPendingCount: () => sender.pendingCount(fromUserId),
+      getNotifyWatch: () => sessionWatcher.current(),
       text: userText,
     };
 
@@ -400,6 +417,37 @@ async function handleMessage(
         trigger: 'manual',
         contextToken,
       });
+      return;
+    }
+
+    if (result.handled && result.notifyAction) {
+      // /notify-me. The watch is service-level: it keeps polling the
+      // watched session's transcript long after this conversation moves on.
+      if (result.notifyAction.kind === 'cancel') {
+        const dropped = sessionWatcher.cancel();
+        sender.enqueuePriority(
+          fromUserId, contextToken,
+          dropped
+            ? `✅ 已取消对 ${shortSessionId(dropped.sessionId)} 的监控。`
+            : 'ℹ️ 当前没有正在监控的会话。',
+          'final',
+        );
+        return;
+      }
+
+      const { sessionId, transcriptPath } = result.notifyAction;
+      const registration = sessionWatcher.register({
+        sessionId, transcriptPath,
+        toUserId: fromUserId, contextToken,
+      });
+      let reply = `✅ 已开始监控会话 ${shortSessionId(registration.sessionId)}`;
+      if (registration.replaced) {
+        reply += `\n（原监控 ${shortSessionId(registration.replaced.sessionId)} 已取消）`;
+      }
+      reply += registration.busy
+        ? '\n该会话当前正在运行中，完成后我会通知你。'
+        : '\n该会话当前空闲，将在下一个任务完成后通知你。';
+      sender.enqueuePriority(fromUserId, contextToken, reply, 'final');
       return;
     }
 
