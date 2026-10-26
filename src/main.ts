@@ -893,8 +893,15 @@ async function handleMessage(
       getChatHistoryText: (limit?: number) => sessionStore.getChatHistoryText(session, limit),
       getPendingCount: () => sender.pendingCount(fromUserId),
       getNotifyWatch: () => sessionWatcher.current(),
+      startedAt: SERVICE_STARTED_AT,
       text: userText,
     };
+
+    // Record the slash command itself in chatHistory so /history can show
+    // local control actions alongside normal conversation. Without this,
+    // slash commands short-circuit before sendToClaude runs and never reach
+    // addChatMessage — leaving /history blind to /session, /cwd, /clear, etc.
+    sessionStore.addChatMessage(session, 'user', userText);
 
     const result: CommandResult = routeCommand(ctx);
 
@@ -912,6 +919,8 @@ async function handleMessage(
     }
 
     if (result.handled && result.claudePrompt) {
+      // claudePrompt is a virtual user message routed to Claude; the regular
+      // sendToClaude path will record its own user entry and assistant reply.
       await sendToClaude(
         result.claudePrompt, imageItem, fileItem, fromUserId, contextToken,
         account, session, sessionStore, sender, config, activeControllers,
@@ -969,7 +978,9 @@ async function handleMessage(
 
     if (result.handled) return;
 
-    // Not handled, treat as normal message (fall through)
+    // Not handled, treat as normal message (fall through). Remove the
+    // earlier "user" record we just added since sendToClaude will re-add it.
+    session.chatHistory.pop();
   }
 
   // -- Normal message -> Claude --
@@ -1820,6 +1831,34 @@ async function sendToClaude(
       },
     };
 
+    // Validate the bound session id still has a transcript on disk.
+    // Without this, a stale id (aged out, manually deleted, or lost on a
+    // crashed session) costs an extra Claude spawn on every turn AND —
+    // worse — silently loses the user's context: the resume-failed retry
+    // below rewrites sdkSessionId to a brand-new id without surfacing that
+    // to the user. Pre-flight makes the loss visible, and once we clear
+    // sdkSessionId here `hadSessionBefore` falls through to `false` so the
+    // existing "new session created" notice fires with the fresh id.
+    if (session.sdkSessionId) {
+      const livePath = findSdkSessionPath(session.sdkSessionId, session.workingDirectory);
+      if (!livePath) {
+        const stale = session.sdkSessionId;
+        session.sdkSessionId = undefined;
+        sessionStore.save(account.accountId, session);
+        sender.enqueue(
+          fromUserId,
+          contextToken,
+          `⚠️ 上次会话 ${stale.slice(0, 8)}… 找不到（可能被清理或老化），本次将开新会话`,
+          'final',
+        );
+      }
+    }
+
+    // Was a session bound when this turn started? Drives the one-shot
+    // "new session created" notice below. Computed BEFORE the query so the
+    // resume-failed retry path (which clears the id mid-turn) can't make a
+    // degraded resume look like a deliberate fresh session.
+    const hadSessionBefore = !!session.sdkSessionId;
 
     // Measured across the query (and its resume-failed retry), because the
     // compact path asks "was this turn short *and* quick?" — a turn that
@@ -1845,7 +1884,7 @@ async function sendToClaude(
     // the same per-user queue, preserving order.
     router.drain();
 
-    // Send result back to WeChat
+    // Record the turn in the local history.
     if (result.text) {
       if (result.error) {
         logger.warn('Claude query had error but returned text, using text', { error: result.error });
@@ -1874,12 +1913,27 @@ async function sendToClaude(
     }
 
     // Update session with new SDK session ID
-    session.sdkSessionId = result.sessionId || undefined;
+    const newSessionId = result.sessionId || undefined;
+    session.sdkSessionId = newSessionId;
     session.state = 'idle';
     // Turn finished cleanly — clear the in-flight marker.
     session.pendingTurn = undefined;
     sessionStore.save(account.accountId, session);
 
+    // Announce the new id once, when the turn started with NO session bound.
+    // Without this the id is effectively invisible: /session only ever shows
+    // `shortId` (first 8 chars), and nothing else surfaces the full UUID, so
+    // a user who cleared the session or hit an unresolvable id had no way to
+    // learn what they were now talking to.
+    if (!hadSessionBefore && newSessionId) {
+      sender.enqueue(
+        fromUserId,
+        contextToken,
+        `📋 新会话已创建\n会话 ID: ${newSessionId}\n` +
+          `之后可用 /session ${newSessionId.slice(0, 8)} 切回这个会话。`,
+        'final',
+      );
+    }
 
     // Auto-push deliverable files mentioned in Claude's response. Each file goes
   // through the per-user worker queue so circuit-breaker and pacing are honored

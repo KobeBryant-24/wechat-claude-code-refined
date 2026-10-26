@@ -10,6 +10,11 @@ export interface CommandContext {
   clearSession: () => Session;
   getChatHistoryText?: (limit?: number) => string;
   /**
+   * Service process start time (ms since epoch). Captured once at daemon
+   * startup and reused across all messages so `/status` can show uptime.
+   */
+  startedAt: number;
+  /**
    * How many messages are still queued for this user, waiting on the
    * outbound budget. Lets `/status` show what is stuck and why.
    */

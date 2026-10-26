@@ -18,6 +18,8 @@ const HELP_TEXT = `可用命令：
   /clear            清除当前会话
   /reset            完全重置（包括工作目录等设置）
   /status           查看当前会话状态
+  /session <ID>     切换到指定的 SDK 会话（完整 ID 或唯一前缀）
+  /session <序号>   按 /session 列表里的编号切换
   /notify-me <会话ID>  监控该会话，本轮完成时微信通知我
   /notify-me off    取消会话监控
   /compact          压缩上下文（开始新 SDK 会话，保留历史）
@@ -68,6 +70,136 @@ export function handleClear(ctx: CommandContext): CommandResult {
   const newSession = ctx.clearSession();
   Object.assign(ctx.session, newSession);
   return { reply: '✅ 会话已清除，下次消息将开始新会话。', handled: true };
+}
+
+/**
+ * Switch to an existing Claude Code SDK session by ID.
+ *
+ * IMPORTANT: Claude Code couples sessions to their working directory. From the
+ * docs (sessions): a session "is anchored to your current directory", `claude
+ * --resume` ignores the spawn cwd and uses the cwd recorded in the session
+ * transcript (the latest `cwd` field in the JSONL — after v2.1.169's `/cd`
+ * command, a session can relocate to a different directory mid-flight, and
+ * --resume will look for the session there). v2.1.223+ can find a session
+ * across directories, but the resumed session still uses its own recorded cwd.
+ *
+ * Because of this coupling, we MUST update both `sdkSessionId` AND
+ * `workingDirectory` together, or tool calls (file reads, Bash, etc.) will run
+ * against the wrong project. There is no `--keep-cwd` opt-out — it would
+ * silently desync daemon state from what Claude Code actually does.
+ */
+export function handleSession(ctx: CommandContext, args: string): CommandResult {
+  const raw = args.trim();
+
+  if (!raw) {
+    // No ID supplied — list recently used SDK sessions so the user can pick one.
+    return { reply: listSdkSessions(ctx), handled: true };
+  }
+
+  // Two reference forms, deliberately kept disjoint:
+  //   /session <1>       angle-bracketed index into the last listing
+  //   /session 1         session-id prefix (bare number)
+  // A bare number cannot mean both. UUIDs are hex, so "0162" is a real
+  // session prefix, but "1" is also how you'd say "the first row" — and one
+  // character matches a large slice of the namespace, so the index form would
+  // read as ambiguous on almost any machine. Angle brackets remove the
+  // collision instead of letting one meaning win arbitrarily.
+  let id = raw;
+  const indexMatch = /^<(\d+)>$/.exec(raw);
+  if (indexMatch) {
+    const snapshot = ctx.session.lastSessionList ?? [];
+    const entry = snapshot[parseInt(indexMatch[1], 10) - 1];
+    if (!entry) {
+      return {
+        reply:
+          `⚠️ 编号 ${indexMatch[1]} 超出范围（上次列表只有 ${snapshot.length} 条）\n` +
+          `请先 /session 重新生成列表`,
+        handled: true,
+      };
+    }
+    id = entry.id;
+  }
+
+  // Resolve to a REAL transcript before binding anything. `id` may be a short
+  // prefix; `lookup.fullId` is always the complete UUID we must store, because
+  // `claude --resume` accepts nothing shorter.
+  const lookup = findSessionFile(id);
+
+  if (lookup.kind === 'ambiguous') {
+    const shown = lookup.matches.slice(0, 5).map((m) => `  · ${m}`).join('\n');
+    return {
+      reply:
+        `⚠️ "${raw}" 同时匹配 ${lookup.matches.length} 个会话，未切换：\n${shown}\n` +
+        `请补长前缀（能唯一确定一个），或用 /session 重新看列表。`,
+      handled: true,
+    };
+  }
+
+  if (lookup.kind === 'missing') {
+    // Never bind an id that has no transcript on disk. Binding it makes the
+    // daemon send `claude --resume <garbage>` on the next message, which
+    // Claude rejects outright — every turn then silently starts fresh while
+    // the state table claims a resume is configured.
+    ctx.updateSession({ sdkSessionId: undefined });
+    return {
+      reply:
+        `⚠️ 找不到会话 ${raw}\n` +
+        `已断开当前会话绑定，下次消息将开一个全新会话。\n` +
+        `用 /session 查看可切换的会话列表。`,
+      handled: true,
+    };
+  }
+
+  // Look up the session's recorded cwd (the LATEST one, since mid-session
+  // `/cd` can relocate the session).
+  const recordedCwd = readSessionMeta(lookup.sessionPath).cwd;
+
+  if (recordedCwd) {
+    ctx.updateSession({ sdkSessionId: lookup.fullId, workingDirectory: recordedCwd });
+    return {
+      reply:
+        `✅ 已切换到 SDK 会话: ${lookup.fullId}\n` +
+        `📁 工作目录已自动同步: ${recordedCwd}\n` +
+        `下次消息将用 --resume 恢复该会话。`,
+      handled: true,
+    };
+  }
+
+  // No cwd recorded in the transcript (very rare for SDK sessions). We still
+  // bind the full session ID but warn — the daemon's workingDirectory may not
+  // match what Claude Code will use on resume.
+  ctx.updateSession({ sdkSessionId: lookup.fullId });
+  return {
+    reply:
+      `✅ 已切换到 SDK 会话: ${lookup.fullId}\n` +
+      `⚠️ 未在 transcript 中找到 cwd 记录，当前工作目录保持为 ${ctx.session.workingDirectory}\n` +
+      `（如 Claude 实际使用的目录不一致，可用 /cwd 手动修正）\n` +
+      `下次消息将用 --resume 恢复该会话。`,
+    handled: true,
+  };
+}
+
+const LIST_LIMIT = 10;
+const SUMMARY_MAX = 50;        // visible summary length
+const HEAD_WINDOW = 32 * 1024; // enough for first user msg + early custom-title
+const TAIL_WINDOW = 64 * 1024; // tail window for latest cwd after late /cd
+
+interface SdkSessionInfo {
+  id: string;
+  projectDir: string;
+  cwd?: string;
+  summary?: string;       // first user message, truncated
+  customTitle?: string;   // /rename'd title, if any
+  gitBranch?: string;
+  mtimeMs: number;
+  sizeBytes: number;
+}
+
+interface SessionMeta {
+  cwd?: string;
+  summary?: string;
+  customTitle?: string;
+  gitBranch?: string;
 }
 
 type SessionLookup =
@@ -143,10 +275,588 @@ function findSessionFile(id: string): SessionLookup {
   }
   return { kind: 'missing' };
 }
+
+/**
+ * Pull the bits we need from a session JSONL without reading the whole file:
+ *   - cwd: latest entry's cwd (Claude's `/cd` can relocate mid-session; the
+ *     most recent record is what `claude --resume` will actually use)
+ *   - summary: text of the first user message (truncated)
+ *   - customTitle: last `custom-title` entry written by `/rename`
+ *   - gitBranch: from any entry that records it
+ *
+ * Mirrors what the official Claude Agent SDK's `listSessions()` does — scan
+ * the project directory + read head/tail of each transcript, no subprocess,
+ * no API call.
+ */
+function readSessionMeta(sessionPath: string): SessionMeta {
+  let fd: number | undefined;
+  const out: SessionMeta = {};
+  try {
+    const size = statSync(sessionPath).size;
+    if (size === 0) return out;
+
+    fd = openSync(sessionPath, 'r');
+
+    // Head pass: cwd (latest in head wins), first user message, custom-title
+    // entries, and gitBranch. HEAD_WINDOW is large enough for the first user
+    // turn + any in-session /rename done early.
+    const headSize = Math.min(HEAD_WINDOW, size);
+    const headBuf = Buffer.alloc(headSize);
+    const headRead = readSync(fd, headBuf, 0, headBuf.length, 0);
+    const headText = headBuf.toString('utf-8', 0, headRead);
+
+    for (const line of headText.split('\n')) {
+      if (!line.trim()) continue;
+      let obj: any;
+      try { obj = JSON.parse(line); } catch { continue; }
+
+      if (typeof obj.cwd === 'string' && obj.cwd) {
+        out.cwd = obj.cwd;
+      }
+      if (typeof obj.gitBranch === 'string' && obj.gitBranch) {
+        out.gitBranch = obj.gitBranch;
+      }
+      if (!out.summary && obj.type === 'user' && obj.message?.role === 'user') {
+        const text = extractFirstText(obj.message.content);
+        if (text) out.summary = truncateSummary(text);
+      }
+      // Claude Code's `/rename` and the SDK's `rename_session()` append a
+      // top-level entry like {"type":"custom-title","title":"...","sessionId":"..."}.
+      // Latest one in the file wins (matches SDK behavior).
+      if (obj.type === 'custom-title' && typeof obj.title === 'string' && obj.title) {
+        out.customTitle = obj.title;
+      }
+    }
+
+    // If the file is bigger than HEAD_WINDOW, a `/cd` after the head window
+    // won't show up there — fall through to the tail to pick up the freshest
+    // cwd recorded.
+    if (size > HEAD_WINDOW) {
+      const tailSize = Math.min(TAIL_WINDOW, size - HEAD_WINDOW);
+      const tailBuf = Buffer.alloc(tailSize);
+      const tailOffset = size - tailBuf.length;
+      const tailRead = readSync(fd, tailBuf, 0, tailBuf.length, tailOffset);
+      const tailText = tailBuf.toString('utf-8', 0, tailRead);
+      const tailLines = tailText.split('\n');
+      // If we didn't start at offset 0, the first line is a partial record
+      // straddling the boundary; drop it so we never parse garbage.
+      const startIdx = tailOffset > 0 ? 1 : 0;
+      for (let i = tailLines.length - 1; i >= startIdx; i--) {
+        const line = tailLines[i];
+        if (!line.trim()) continue;
+        let obj: any;
+        try { obj = JSON.parse(line); } catch { continue; }
+        if (typeof obj.cwd === 'string' && obj.cwd) {
+          out.cwd = obj.cwd;
+          break;
+        }
+      }
+    }
+  } catch {
+    // unreadable — return whatever we managed to collect
+  } finally {
+    if (fd !== undefined) {
+      try { closeSync(fd); } catch { /* ignore */ }
+    }
+  }
+  return out;
+}
+
+function extractFirstText(content: unknown): string | undefined {
+  if (typeof content === 'string') return content.trim();
+  if (Array.isArray(content)) {
+    for (const block of content) {
+      if (block && typeof block === 'object' && (block as any).type === 'text') {
+        const text = (block as any).text;
+        if (typeof text === 'string' && text.trim()) return text.trim();
+      }
+    }
+  }
+  return undefined;
+}
+
+function truncateSummary(text: string): string {
+  // Strip leading "-" (slash command queued via stdin often serializes as
+  // "-\n<cmd>"), collapse whitespace, and clip to a readable length.
+  const cleaned = text
+    .replace(/^[-–—]\s*/, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (cleaned.length <= SUMMARY_MAX) return cleaned;
+  return cleaned.slice(0, SUMMARY_MAX - 1) + '…';
+}
+
+function formatRelativeTime(ms: number): string {
+  const delta = Date.now() - ms;
+  if (delta < 60_000) return '刚刚';
+  if (delta < 3_600_000) return `${Math.floor(delta / 60_000)} 分钟前`;
+  if (delta < 86_400_000) return `${Math.floor(delta / 3_600_000)} 小时前`;
+  if (delta < 7 * 86_400_000) return `${Math.floor(delta / 86_400_000)} 天前`;
+  return new Date(ms).toLocaleDateString('zh-CN');
+}
+
+function decodeProjectDirName(encoded: string): string {
+  // Claude Code stores sessions under ~/.claude/projects/<encoded-cwd>/
+  // where the cwd's path separators and dots are escaped to dashes. We can
+  // partially recover a human-readable hint, but the encoding is lossy
+  // (real dashes become "--"), so we keep it short and just say "project".
+  return encoded || '(unknown)';
+}
+
+function listSdkSessions(ctx: CommandContext): string {
+  const home = homedir();
+  const projectsDir = join(home, '.claude', 'projects');
+  if (!existsSync(projectsDir)) {
+    return `📂 找不到 ${projectsDir}\n请先在 Claude Code 终端跑过一次对话以生成会话文件。`;
+  }
+
+  const sessions: SdkSessionInfo[] = [];
+  let projectDirs: string[];
+  try {
+    projectDirs = readdirSync(projectsDir);
+  } catch (err) {
+    return `📂 无法读取 ${projectsDir}: ${err instanceof Error ? err.message : String(err)}`;
+  }
+
+  for (const projectDir of projectDirs) {
+    const fullProjectDir = join(projectsDir, projectDir);
+    let dirStat;
+    try {
+      dirStat = statSync(fullProjectDir);
+    } catch {
+      continue;
+    }
+    if (!dirStat.isDirectory()) continue;
+
+    let files: string[];
+    try {
+      files = readdirSync(fullProjectDir);
+    } catch {
+      continue;
+    }
+
+    for (const file of files) {
+      if (!file.endsWith('.jsonl')) continue;
+      const fullPath = join(fullProjectDir, file);
+      try {
+        const fileStat = statSync(fullPath);
+        const meta = readSessionMeta(fullPath);
+        sessions.push({
+          id: file.replace(/\.jsonl$/, ''),
+          projectDir,
+          cwd: meta.cwd,
+          summary: meta.summary,
+          customTitle: meta.customTitle,
+          gitBranch: meta.gitBranch,
+          mtimeMs: fileStat.mtimeMs,
+          sizeBytes: fileStat.size,
+        });
+      } catch {
+        // skip unreadable
+      }
+    }
+  }
+
+  if (sessions.length === 0) {
+    return '📂 暂无 SDK 会话记录。请先在 Claude Code 终端跑过一次对话。';
+  }
+
+  // Most recently active first; cap to LIST_LIMIT entries.
+  sessions.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  const top = sessions.slice(0, LIST_LIMIT);
+
+  const currentId = ctx.session.sdkSessionId;
+  const previousId = ctx.session.previousSdkSessionId;
+  const seen = new Set<string>();
+
+  // Build the ordered display list: pinned first, then the rest. The order
+  // we walk here is the order numbers refer to in `/session <n>` (bracketed).
+  const ordered: Array<{ session: SdkSessionInfo; tag: string }> = [];
+  if (currentId) {
+    const found = sessions.find((s) => s.id === currentId);
+    if (found) { ordered.push({ session: found, tag: '★ 当前' }); seen.add(found.id); }
+  }
+  if (previousId && !seen.has(previousId)) {
+    const found = sessions.find((s) => s.id === previousId);
+    if (found) { ordered.push({ session: found, tag: '◦ 上次' }); seen.add(found.id); }
+  }
+  for (const s of top) {
+    if (seen.has(s.id)) continue;
+    ordered.push({ session: s, tag: '' });
+  }
+
+  const lines: string[] = [];
+  lines.push(`📂 可用 SDK 会话（最近 ${top.length} 个，按最后活动排序）：`);
+  lines.push('');
+  // Markdown table. WeChat renders this natively (better than ASCII boxes
+  // which don't align in the client's proportional font). Column widths are
+  // chosen so a typical row fits without horizontal scroll on mobile.
+  lines.push('| # | 标题 | ID | 目录 | 时间 | 大小 |');
+  lines.push('| --- | --- | --- | --- | --- | --- |');
+
+  let lastHadTag = false;
+  for (let i = 0; i < ordered.length; i++) {
+    const { session: s, tag } = ordered[i];
+    if (tag && i > 0 && !lastHadTag) lines.push('');
+    const numStr = tag ? `${tag} ${i + 1}` : String(i + 1);
+    lines.push(formatSessionRow(s, numStr));
+    if (tag) lastHadTag = true;
+  }
+
+  if (sessions.length > top.length) {
+    lines.push('');
+    lines.push(`…还有 ${sessions.length - top.length} 个较旧的会话`);
+  }
+
+  // Persist the snapshot so `/session <n>` can resolve index lookups.
+  ctx.updateSession({ lastSessionList: ordered.map(({ session }) => ({ id: session.id })) });
+
+  lines.push('');
+  lines.push('用法:');
+  lines.push('  /session <序号>          按上面的编号切换（下次消息用 --resume 恢复）');
+  lines.push('  /session <会话号前缀>     按会话号前缀切换，ID 列可直接复制');
+  return lines.join('\n');
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function formatSessionLocation(s: SdkSessionInfo): string {
+  // Prefer the recorded cwd over the lossy encoded dirname. The encoded
+  // form ('F--AI-Code-Project') is shown only when we couldn't read cwd.
+  if (s.cwd) return s.cwd;
+  return decodeProjectDirName(s.projectDir);
+}
+
+/**
+ * Render one session as a single table row. Uses WeChat-rendered markdown
+ * table format: the receiver renders the columns natively, so we don't have
+ * to fake alignment with box-drawing characters (which look bad in
+ * monospace terminals but also don't align in WeChat's proportional font).
+ *
+ * Columns are space-budgeted so the worst case still fits in a single WeChat
+ * text bubble without horizontal scrolling:
+ *   # | 标题 (28 chars) | ID (8) | 目录 (40) | 时间 (10) | 大小 (8)
+ *
+ * The current/pinned tag is folded into the # column as a badge so the
+ * table header never needs a dedicated "status" column.
+ *
+ * `numStr` is the cell content for the # column — typically just a number,
+ * or "★ 当前 N" / "◦ 上次 N" for pinned entries. The caller has already
+ * formatted the badge so this function stays free of presentation choices.
+ */
+function formatSessionRow(s: SdkSessionInfo, numStr: string): string {
+  const headline = s.customTitle ?? s.summary ?? shortId(s.id);
+  const title = truncateForCell(headline, 28);
+  const id = shortId(s.id);
+  const location = truncateForCell(formatSessionLocation(s), 40);
+  const time = truncateForCell(formatRelativeTime(s.mtimeMs), 10);
+  const size = formatBytes(s.sizeBytes);
+  return `| ${numStr} | ${title} | \`${id}\` | ${location} | ${time} | ${size} |`;
+}
+
+/**
+ * Pad / truncate a string for a single markdown table cell. Cells can't
+ * contain raw newlines in WeChat's renderer, so we collapse whitespace.
+ * Use this for short, single-line columns (e.g. the /session listing);
+ * for multi-line transcript content use escapeForCell instead.
+ */
+function truncateForCell(text: string, max: number): string {
+  const flat = text.replace(/\s+/g, ' ').trim();
+  if (flat.length <= max) return flat;
+  if (max <= 1) return flat.slice(0, max);
+  return flat.slice(0, max - 1) + '…';
+}
+
+/**
+ * Sanitize a string for a markdown table cell that may contain multi-line
+ * content (assistant paragraphs, tool input blobs, etc).
+ *
+ * - Literal newlines become `<br>` so multi-line content keeps its
+ *   structure when WeChat renders the cell. A raw `\n` would terminate the
+ *   table row and corrupt the surrounding rows.
+ * - Pipes are escaped to `\|` since they would otherwise be interpreted as
+ *   column separators.
+ * - Long content is trimmed by **line count first** (keeps paragraph
+ *   structure intact), then by per-line character count as a guard rail
+ *   against pathological inputs (e.g. a single 5KB log line). A trailing
+ *   `…` makes it obvious the cell was trimmed.
+ */
+function escapeForCell(
+  text: string,
+  opts: { maxLines?: number; maxLineLen?: number } = {},
+): string {
+  const { maxLines = 8, maxLineLen = 240 } = opts;
+  const rawLines = text.replace(/\r\n?/g, '\n').split('\n');
+  let lines = rawLines.map((l) => l.trimEnd());
+  // Trim trailing empty lines but keep internal blanks that separate
+  // paragraphs.
+  while (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
+
+  if (lines.length > maxLines) {
+    lines = lines.slice(0, maxLines);
+    lines.push('…');
+  }
+
+  return lines
+    .map((line) => {
+      let s = line.replace(/\|/g, '\\|');
+      if (s.length > maxLineLen) {
+        s = s.slice(0, maxLineLen - 1) + '…';
+      }
+      return s;
+    })
+    .join('<br>');
+}
+
 function shortId(id: string): string {
   // The one definition of "the short session id" — see shortSessionId.
   return shortSessionId(id);
 }
+
+// ---------------------------------------------------------------------------
+// /history: read the SDK session transcript from JSONL
+// ---------------------------------------------------------------------------
+
+const TRANSCRIPT_TAIL = 512 * 1024;  // bounded tail read (512 KB)
+const CONTENT_MAX = 800;             // per-message text truncation
+const TOOL_BRIEF_MAX = 100;
+
+interface TranscriptEntry {
+  role: 'user' | 'assistant';
+  content: string;
+  toolUses: Array<{ name: string; brief: string }>;
+  timestamp: number;
+}
+
+function encodeProjectDir(cwd: string): string {
+  // Claude Code replaces every non-alphanumeric char in cwd with `-`.
+  // See https://code.claude.com/docs/en/sessions — `~/.claude/projects/`
+  // uses this encoding for the project directory name.
+  return cwd.replace(/[^a-zA-Z0-9]/g, '-');
+}
+
+function findSdkSessionPath(sessionId: string, cwd: string): string | undefined {
+  const projectsDir = join(homedir(), '.claude', 'projects');
+  if (!existsSync(projectsDir)) return undefined;
+  // Exact match first (fast path).
+  const exact = join(projectsDir, encodeProjectDir(cwd), `${sessionId}.jsonl`);
+  if (existsSync(exact)) return exact;
+  // Fall back to scanning every project dir — handles the case where the
+  // session was created in another cwd or moved via `/cd`.
+  let projectDirs: string[];
+  try { projectDirs = readdirSync(projectsDir); } catch { return undefined; }
+  for (const dir of projectDirs) {
+    const candidate = join(projectsDir, dir, `${sessionId}.jsonl`);
+    if (existsSync(candidate)) return candidate;
+  }
+  return undefined;
+}
+
+/**
+ * Read the tail of an SDK session JSONL and return the last `messageLimit`
+ * user/assistant entries. Bounded I/O — never reads the full (potentially
+ * 100 MB+) transcript.
+ */
+function readSdkTranscript(
+  sessionPath: string,
+  messageLimit: number,
+  skipFromTail = 0,
+): TranscriptEntry[] {
+  // skipFromTail discards the N most recent entries first (offset semantics:
+  // 0 = newest page; N = skip the latest N entries and return what comes
+  // before). This is what /history <limit> <offset> uses to paginate
+  // backwards through an old transcript.
+  const entries: TranscriptEntry[] = [];
+  let fd: number | undefined;
+  try {
+    const size = statSync(sessionPath).size;
+    if (size === 0) return entries;
+
+    fd = openSync(sessionPath, 'r');
+    const readSize = Math.min(TRANSCRIPT_TAIL, size);
+    const offset = Math.max(0, size - readSize);
+    const buf = Buffer.alloc(readSize);
+    const bytesRead = readSync(fd, buf, 0, readSize, offset);
+    const text = buf.toString('utf-8', 0, bytesRead);
+
+    const lines = text.split('\n');
+    // If we didn't read from offset 0, the first line is partial — drop it.
+    const startIdx = offset > 0 ? 1 : 0;
+
+    for (let i = startIdx; i < lines.length; i++) {
+      const line = lines[i];
+      if (!line.trim()) continue;
+      let obj: any;
+      try { obj = JSON.parse(line); } catch { continue; }
+
+      if (obj.type === 'user' && obj.message?.role === 'user') {
+        const entry = formatUserEntry(obj);
+        if (entry) entries.push(entry);
+      } else if (obj.type === 'assistant' && obj.message?.role === 'assistant') {
+        const entry = formatAssistantEntry(obj);
+        if (entry) entries.push(entry);
+      }
+      // Skip queue-operation, last-prompt, mode, permission-mode, attachment,
+      // custom-title, and other metadata-only entries.
+    }
+  } catch {
+    // unreadable — return whatever we got
+  } finally {
+    if (fd !== undefined) try { closeSync(fd); } catch { /* ignore */ }
+  }
+
+  // Apply offset (skip the most recent N entries) and limit, both measured
+  // in chat-message units, not raw JSONL lines.
+  const tail = entries.slice(-(messageLimit + skipFromTail));
+  return skipFromTail > 0 ? tail.slice(0, -skipFromTail) : tail;
+}
+
+function formatUserEntry(obj: any): TranscriptEntry | null {
+  const content = obj.message?.content;
+  let text = '';
+  if (typeof content === 'string') {
+    text = content;
+  } else if (Array.isArray(content)) {
+    for (const block of content) {
+      if (block?.type === 'text' && typeof block.text === 'string') {
+        text = block.text;
+        break;
+      }
+    }
+    // Pure tool_result blocks — skip showing them, the assistant's next
+    // message will reference the result.
+    if (!text) return null;
+  }
+  return {
+    role: 'user',
+    content: truncateContent(stripQueuePrefix(text)),
+    toolUses: [],
+    timestamp: parseTimestamp(obj.timestamp),
+  };
+}
+
+function formatAssistantEntry(obj: any): TranscriptEntry | null {
+  const content = obj.message?.content;
+  if (!Array.isArray(content)) return null;
+
+  const textParts: string[] = [];
+  const toolUses: Array<{ name: string; brief: string }> = [];
+  for (const block of content) {
+    if (block?.type === 'text' && typeof block.text === 'string') {
+      textParts.push(block.text);
+    } else if (block?.type === 'tool_use' && block.name) {
+      toolUses.push({
+        name: block.name,
+        brief: formatToolUseBrief(block.name, block.input),
+      });
+    }
+  }
+  const text = textParts.join('\n').trim();
+  if (!text && toolUses.length === 0) return null;
+  return {
+    role: 'assistant',
+    content: truncateContent(text),
+    toolUses,
+    timestamp: parseTimestamp(obj.timestamp),
+  };
+}
+
+function formatToolUseBrief(name: string, input: any): string {
+  if (!input || typeof input !== 'object') return '';
+  const shorten = (p: string) => {
+    const home = homedir();
+    return p.startsWith(home) ? '~' + p.slice(home.length) : p;
+  };
+  switch (name) {
+    case 'Read':
+    case 'Edit':
+    case 'Write':
+    case 'MultiEdit':
+    case 'NotebookEdit':
+      return shorten(String(input.file_path ?? input.notebook_path ?? ''));
+    case 'Bash':
+      return String(input.command ?? '').split('\n')[0].slice(0, TOOL_BRIEF_MAX);
+    case 'Glob':
+      return String(input.pattern ?? '');
+    case 'Grep':
+      return [
+        input.path ? shorten(String(input.path)) : '',
+        input.pattern ? String(input.pattern) : '',
+      ].filter(Boolean).join(' ');
+    case 'Agent':
+    case 'Task':
+      return String(input.description ?? input.prompt ?? '').slice(0, TOOL_BRIEF_MAX);
+    case 'WebFetch':
+      return String(input.url ?? '').slice(0, TOOL_BRIEF_MAX);
+    case 'WebSearch':
+      return String(input.query ?? '').slice(0, TOOL_BRIEF_MAX);
+    default:
+      try {
+        return JSON.stringify(input).slice(0, TOOL_BRIEF_MAX);
+      } catch {
+        return '';
+      }
+  }
+}
+
+function parseTimestamp(ts: unknown): number {
+  if (typeof ts === 'string') {
+    const t = new Date(ts).getTime();
+    return Number.isFinite(t) ? t : Date.now();
+  }
+  if (typeof ts === 'number') return ts;
+  return Date.now();
+}
+
+function stripQueuePrefix(text: string): string {
+  // stdin queue serializes messages as "-\n<text>"; strip the marker.
+  return text.replace(/^[-–—]\s*\n?/, '').trimStart();
+}
+
+function truncateContent(text: string): string {
+  if (text.length <= CONTENT_MAX) return text;
+  return text.slice(0, CONTENT_MAX - 1) + '…';
+}
+
+function formatTimestamp(ms: number): string {
+  return new Date(ms).toLocaleString('zh-CN', { hour12: false });
+}
+
+function formatTranscriptForWeChat(entries: TranscriptEntry[]): string {
+  if (entries.length === 0) return '（该 session 的 transcript 为空）';
+  // Markdown table. WeChat renders it natively, much easier to scan than the
+  // old "header line + content block" layout. Tool uses are inlined into the
+  // 工具 column as a compact list so the table stays 6 rows wide regardless
+  // of how many tools each turn invoked.
+  const lines: string[] = [];
+  lines.push('| # | 时间 | 角色 | 内容 | 工具 |');
+  lines.push('| --- | --- | --- | --- | --- |');
+
+  for (let i = 0; i < entries.length; i++) {
+    const e = entries[i];
+    const num = entries.length - i; // newest = 1
+    const role = e.role === 'user' ? '👤 USER' : '🤖 CLAUDE';
+    const time = formatTimestamp(e.timestamp);
+    let content = e.content ? escapeForCell(e.content) : '';
+    // Slash commands deserve a visual cue since they don't reach Claude.
+    if (e.role === 'user' && content.startsWith('/')) {
+      content = '⚙ ' + content;
+    }
+    const tools = e.toolUses.length
+      ? e.toolUses.map((t) => {
+          const brief = t.brief ? ` ${escapeForCell(t.brief)}` : '';
+          return `\`${t.name}\`${brief}`;
+        }).join('<br>')
+      : '—';
+    lines.push(`| ${num} | ${time} | ${role} | ${content} | ${tools} |`);
+  }
+  return lines.join('\n');
+}
+
 export function handleCwd(ctx: CommandContext, args: string): CommandResult {
   if (!args) {
     return { reply: `当前工作目录: ${ctx.session.workingDirectory}\n用法: /cwd <路径>`, handled: true };
@@ -165,6 +875,10 @@ export function handleModel(ctx: CommandContext, args: string): CommandResult {
 
 export function handleStatus(ctx: CommandContext): CommandResult {
   const s = ctx.session;
+  const startedAt = ctx.startedAt;
+  const startedAtText = new Date(startedAt).toLocaleString('zh-CN');
+  const uptimeMs = Math.max(0, Date.now() - startedAt);
+  const uptimeText = formatUptime(uptimeMs);
   const pending = ctx.getPendingCount?.() ?? 0;
   const compact = s.compactMsg ?? loadConfig().compactMsg ?? false;
   const watched = ctx.getNotifyWatch?.();
@@ -178,8 +892,25 @@ export function handleStatus(ctx: CommandContext): CommandResult {
     `整合消息: ${compact ? '开启' : '关闭'}`,
     `监控会话: ${watched ? `${shortId(watched.sessionId)}（${watched.busy ? '运行中' : '空闲'}）` : '无'}`,
     `待发消息: ${pending}${pending > 0 ? '（额度用完时在排队，回复任意消息即可续发）' : ''}`,
+    `main.js PID: ${process.pid}`,
+    `wrapper PID: ${process.ppid}`,
+    `服务启动时间: ${startedAtText}`,
+    `运行时长: ${uptimeText}`,
   ];
   return { reply: lines.join('\n'), handled: true, priority: true };
+}
+
+/** Format a millisecond duration as `Nd HH:mm:ss` (drops days→hours if 0). */
+function formatUptime(ms: number): string {
+  const totalSec = Math.floor(ms / 1000);
+  const days = Math.floor(totalSec / 86400);
+  const hours = Math.floor((totalSec % 86400) / 3600);
+  const minutes = Math.floor((totalSec % 3600) / 60);
+  const seconds = totalSec % 60;
+  const hh = String(hours).padStart(2, '0');
+  const mm = String(minutes).padStart(2, '0');
+  const ss = String(seconds).padStart(2, '0');
+  return days > 0 ? `${days}d ${hh}:${mm}:${ss}` : `${hh}:${mm}:${ss}`;
 }
 
 export function handleSkills(args: string): CommandResult {
@@ -201,15 +932,94 @@ export function handleSkills(args: string): CommandResult {
 const MAX_HISTORY_LIMIT = 100;
 
 export function handleHistory(ctx: CommandContext, args: string): CommandResult {
-  const limit = args ? parseInt(args, 10) : 20;
-  if (isNaN(limit) || limit <= 0) {
-    return { reply: '用法: /history [数量]\n例: /history 50（显示最近50条对话）', handled: true };
+  // Two numeric args: `<limit> [skipFromTail]`.
+  //   /history         → limit 20, skip 0 (latest 20 entries)
+  //   /history 50      → limit 50, skip 0 (latest 50)
+  //   /history 50 20   → skip the latest 20, then show the next 50
+  //                      (useful for paging back through long sessions)
+  // `0` as the limit means "no limit" — capped at MAX_HISTORY_LIMIT.
+  const tokens = args.trim().split(/\s+/).filter(Boolean);
+  if (tokens.length > 2) {
+    return { reply: '用法: /history [数量] [跳过]\n例: /history 50（最近50条）\n     /history 50 20（跳过最新20条，再显示50条）', handled: true };
   }
-  const effectiveLimit = Math.min(limit, MAX_HISTORY_LIMIT);
+  const limitRaw = tokens[0] !== undefined ? parseInt(tokens[0], 10) : 20;
+  const skipRaw = tokens[1] !== undefined ? parseInt(tokens[1], 10) : 0;
+  if (isNaN(limitRaw) || limitRaw < 0 || isNaN(skipRaw) || skipRaw < 0) {
+    return { reply: '用法: /history [数量] [跳过]\n数量和跳过必须是非负整数。', handled: true };
+  }
+  // limitRaw === 0 → "all available", capped. Negative already rejected.
+  const limit = limitRaw === 0 ? MAX_HISTORY_LIMIT : Math.min(limitRaw, MAX_HISTORY_LIMIT);
+  const skipFromTail = skipRaw;
 
-  const historyText = ctx.getChatHistoryText?.(effectiveLimit) || '暂无对话记录';
+  const s = ctx.session;
 
-  return { reply: `📝 对话记录（最近${effectiveLimit}条）:\n\n${historyText}`, handled: true };
+  // Prefer the SDK session transcript (the source of truth — what's actually
+  // in Claude's context). Fall back to local chatHistory only when there is
+  // no SDK session yet (e.g. before the first turn completes, or in
+  // environments where the transcript isn't readable).
+  let body: string;
+  let source: string;
+  let totalShown: number;
+  let pageLabel: string;
+
+  if (s.sdkSessionId) {
+    const sessionPath = findSdkSessionPath(s.sdkSessionId, s.workingDirectory);
+    if (sessionPath) {
+      const entries = readSdkTranscript(sessionPath, limit, skipFromTail);
+      body = formatTranscriptForWeChat(entries);
+      source = `SDK session ${shortId(s.sdkSessionId)} · transcript`;
+      totalShown = entries.length;
+      pageLabel = skipFromTail > 0
+        ? `跳过最新 ${skipFromTail} 条，显示其后 ${totalShown} 条`
+        : `最近 ${totalShown} 条`;
+      return {
+        reply: `📝 ${source}（${pageLabel}）:\n\n${body}`,
+        handled: true,
+        priority: true,
+      };
+    }
+    // sdkSessionId set but no file found — fall back to local.
+    source = `SDK session ${shortId(s.sdkSessionId)}（transcript 不可读，回退到本地）`;
+  } else {
+    source = '本地缓存（当前没有活动的 SDK session）';
+  }
+
+  // Local fallback path — apply offset/limit here too. getChatHistoryText
+  // only knows about limit, so slice the in-memory array ourselves first.
+  const fullHistory = s.chatHistory || [];
+  const startIdx = Math.max(0, fullHistory.length - skipFromTail - limit);
+  const endIdx = Math.max(0, fullHistory.length - skipFromTail);
+  const slice = fullHistory.slice(startIdx, endIdx);
+  totalShown = slice.length;
+  pageLabel = skipFromTail > 0
+    ? `跳过最新 ${skipFromTail} 条，显示其后 ${totalShown} 条`
+    : `最近 ${totalShown} 条`;
+  body = totalShown === 0
+    ? '（暂无对话记录）'
+    : formatLocalHistory(slice);
+  return { reply: `📝 ${source}（${pageLabel}）:\n\n${body}`, handled: true, priority: true };
+}
+
+/**
+ * Format a slice of session.chatHistory as the same markdown table used by
+ * the SDK transcript path. Mirrors the column layout of
+ * formatTranscriptForWeChat so /history looks the same regardless of source.
+ */
+function formatLocalHistory(messages: Array<{ role: 'user' | 'assistant'; content: string; timestamp: number }>): string {
+  const lines: string[] = [];
+  lines.push('| # | 时间 | 角色 | 内容 |');
+  lines.push('| --- | --- | --- | --- |');
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i];
+    const num = messages.length - i;
+    const time = new Date(m.timestamp).toLocaleString('zh-CN');
+    const role = m.role === 'user' ? '👤 用户' : '🤖 Claude';
+    let content = (m.content || '').replace(/\s+/g, ' ').trim();
+    if (m.role === 'user' && content.startsWith('/')) content = '⚙ ' + content;
+    if (content.length > 80) content = content.slice(0, 79) + '…';
+    lines.push(`| ${num} | ${time} | ${role} | ${content} |`);
+  }
+  return lines.join('\n');
 }
 
 /** 完全重置会话（包括工作目录等设置） */

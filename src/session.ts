@@ -23,6 +23,12 @@ export interface Session {
   chatHistory: ChatMessage[];
   maxHistoryLength?: number;
   /**
+   * Snapshot of the most recent `/session` listing. Lets the user switch with
+   * `/session <number>` (e.g. `/session <3>`) instead of pasting a UUID.
+   * Refreshed each time `/session` is invoked without args.
+   */
+  lastSessionList?: Array<{ id: string }>;
+  /**
    * The most recent user message that was handed to sendToClaude, regardless
    * of whether the turn completed or was interrupted. Persisted forever (not
    * cleared on success) so a fresh daemon can hand it to Claude as part of
@@ -188,13 +194,26 @@ export function createSessionStore() {
       return '暂无对话记录';
     }
 
+    // Markdown table — WeChat renders natively. Mirrors the columns used by
+    // the SDK transcript path so users get a consistent look whether the
+    // listing comes from the local bridge cache or the live JSONL tail.
     const lines: string[] = [];
-    for (const msg of messages) {
+    lines.push('| # | 时间 | 角色 | 内容 |');
+    lines.push('| --- | --- | --- | --- |');
+
+    for (let i = 0; i < messages.length; i++) {
+      const msg = messages[i];
+      const num = messages.length - i; // newest = 1
       const time = new Date(msg.timestamp).toLocaleString('zh-CN');
-      const role = msg.role === 'user' ? '用户' : 'Claude';
-      lines.push(`[${time}] ${role}:`);
-      lines.push(msg.content);
-      lines.push('');
+      const role = msg.role === 'user' ? '👤 用户' : '🤖 Claude';
+      // Mark slash commands so users can tell local-control actions apart
+      // from regular conversation when reviewing history.
+      let content = (msg.content || '').replace(/\s+/g, ' ').trim();
+      if (msg.role === 'user' && content.startsWith('/')) {
+        content = '⚙ ' + content;
+      }
+      if (content.length > 80) content = content.slice(0, 79) + '…';
+      lines.push(`| ${num} | ${time} | ${role} | ${content} |`);
     }
 
     return lines.join('\n');
