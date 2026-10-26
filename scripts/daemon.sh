@@ -376,6 +376,158 @@ linux_logs() {
 }
 
 # =============================================================================
+# Windows (node-windows) functions
+# =============================================================================
+# Detected when uname -s returns MINGW* / MSYS* / CYGWIN* (Git Bash, MSYS2,
+# Cygwin on Windows). The daemon runs as a real Windows Service registered
+# with the Service Control Manager via the `node-windows` package, which is
+# invoked through scripts/windows-service.cjs.
+#
+# Note: installing or modifying a Windows service requires Administrator
+# privileges. `start` / `install` will fail with a hint if not elevated.
+
+windows_service_script() {
+  # Path to the Node helper, in Windows-native form (needed when the Node
+  # child process is launched via CreateProcess by node-windows).
+  cygpath -w "${PROJECT_DIR}/scripts/windows-service.cjs"
+}
+
+windows_service_name() {
+  # node-windows registers the SCM entry under the `id` field of the Service
+  # object, with `.exe` appended automatically. The display name shown in
+  # services.msc is the friendly `name` field (e.g. "WeChat Claude Code
+  # Bridge"), but SCM queries like `sc.exe query` and `NET START` use the
+  # `id` field as the service key. Verified:
+  #   sc.exe query wechatclaudecodebridge.exe   → STATE: 4 RUNNING
+  #   sc.exe query WeChatClaudeCodeBridge       → 1060 not exists
+  # The previous comment claiming `WeChatClaudeCodeBridge` was the SCM key
+  # was wrong — `npm run daemon:reinstall` silently failed at `sc stop`
+  # because of this exact bug.
+  echo "wechatclaudecodebridge.exe"
+}
+
+windows_is_installed() {
+  # sc.exe exits non-zero when the service does not exist.
+  sc.exe query "$(windows_service_name)" &>/dev/null
+}
+
+windows_run_service() {
+  local subcommand="$1"
+  local node_bin
+  node_bin="$(command -v node 2>/dev/null || echo node)"
+  local win_node_bin
+  win_node_bin="$(cygpath -w "$node_bin")"
+  local win_script
+  win_script="$(windows_service_script)"
+  "$win_node_bin" "$win_script" "$subcommand"
+}
+
+windows_start() {
+  if windows_is_installed; then
+    windows_run_service start
+  else
+    echo "Service not installed yet. Installing now..."
+    echo "(If this fails, re-run from an Administrator Git Bash.)"
+    echo ""
+    windows_run_service install
+  fi
+}
+
+windows_stop() {
+  # Use sc.exe stop directly instead of windows_run_service stop
+  # (node-windows s.stop()). The s.stop() path only marks the wrapper as
+  # "stopping" and relies on the wrapper to self-exit and kill its child,
+  # but in practice wrapper keeps reporting SERVICE_RUNNING to SCM and
+  # neither the child nor the wrapper die — leaving the OLD main.js
+  # process running with stale dist code after `npm run deploy`.
+  #
+  # sc.exe stop forces a SERVICE_STOP_PENDING through SCM, which makes
+  # wrapper.js take its forcekill branch (process.exit on SIGTERM path),
+  # killing both itself and the child main.js. SCM then sees the service
+  # as STOPPED and the FAILURE_ACTIONS recovery (5s/10s/30s/60s restarts)
+  # automatically respawns the wrapper, which in turn reads the freshly
+  # built dist/main.js — completing the redeploy end-to-end.
+  if ! windows_is_installed; then
+    echo "Service not installed (nothing to stop)"
+    return 0
+  fi
+  echo "Stopping service 'WeChatClaudeCodeBridge' (via sc.exe)..."
+  sc.exe stop "$(windows_service_name)" >/dev/null 2>&1 || true
+}
+
+windows_install_watchdog() {
+  windows_run_service install-watchdog
+}
+
+windows_uninstall_watchdog() {
+  windows_run_service uninstall-watchdog
+}
+
+windows_start_watchdog() {
+  windows_run_service start-watchdog
+}
+
+windows_stop_watchdog() {
+  windows_run_service stop-watchdog
+}
+
+windows_restart() {
+  windows_run_service restart
+}
+
+windows_status() {
+  if ! windows_is_installed; then
+    echo "Not installed"
+    return 0
+  fi
+  local output
+  output="$(sc.exe query "$(windows_service_name)" 2>&1)" || true
+  # Use `|| true` on each pipeline below: with `set -o pipefail` (set at the
+  # top of this script), a missing match in grep returns non-zero and would
+  # cause the whole `local` assignment to abort. STOPPED services have no
+  # PID line at all, so the PID extraction will always be empty for them.
+  local state
+  state="$(echo "$output" | grep -E '^\s*STATE\s*:' | sed -E 's/.*STATE\s*:\s*[0-9]+\s+//' | head -1 || true)"
+  state="${state%"${state##*[![:space:]]}"}"  # trim trailing whitespace
+  if [ -z "$state" ]; then
+    state="Unknown"
+  fi
+  local pid
+  pid="$(echo "$output" | grep -E '^\s*PID\s*:' | sed -E 's/.*PID\s*:\s*//' | tr -d '\r' | head -1 || true)"
+  pid="${pid//[[:space:]]/}"  # strip any whitespace
+  if [ -n "$pid" ]; then
+    echo "Running (PID: $pid)"
+  else
+    echo "Installed (state: $state)"
+  fi
+}
+
+windows_logs() {
+  # node-windows writes stdout / stderr / wrapper logs into the directory
+  # passed via `logpath` (configured in scripts/windows-service.cjs to
+  # ${DATA_DIR}/logs). The wrapper .exe and .xml themselves live in
+  # ${PROJECT_DIR}/dist/daemon/, but those are binaries, not logs.
+  local log_dir="${DATA_DIR}/logs"
+  if [ ! -d "$log_dir" ]; then
+    echo "No logs found at $log_dir (has the service been started yet?)"
+    return 0
+  fi
+
+  # `set -o pipefail` (set at the top of this script) makes bare `ls | head`
+  # pipelines fail when the glob has no matches. Wrap in `|| true` to keep
+  # the local assignment alive under `set -e`.
+  local latest
+  latest=$(ls -t "${log_dir}"/wechatclaudecodebridge.*.log "${log_dir}"/bridge-*.log "${log_dir}"/*.log 2>/dev/null | head -1 || true)
+  if [ -z "$latest" ]; then
+    echo "No .log files found in $log_dir"
+    return 0
+  fi
+
+  echo "=== $(basename "$latest") ==="
+  tail -100 "$latest"
+}
+
+# =============================================================================
 # Main dispatcher
 # =============================================================================
 
@@ -411,9 +563,36 @@ main() {
           ;;
       esac
       ;;
+    MINGW*|MSYS*|CYGWIN*)
+      case "$command" in
+        start)     windows_start ;;
+        stop)      windows_stop ;;
+        restart)
+          echo "Error: 'restart' subcommand removed on Windows."
+          echo "The wrapper auto-restarts main.js on exit; for full redeploy use 'npm run redeploy' (build + reinstall)."
+          exit 2
+          ;;
+        status)    windows_status ;;
+        logs)      windows_logs ;;
+        install)   windows_run_service install ;;
+        uninstall) windows_run_service uninstall ;;
+        reinstall) windows_run_service reinstall ;;
+        pause)     windows_run_service pause ;;
+        resume)    windows_run_service resume ;;
+        install-watchdog)   windows_install_watchdog ;;
+        uninstall-watchdog) windows_uninstall_watchdog ;;
+        start-watchdog)     windows_start_watchdog ;;
+        stop-watchdog)      windows_stop_watchdog ;;
+        *)
+          echo "Usage: daemon.sh {start|stop|status|logs|install|uninstall|reinstall|pause|resume|install-watchdog|uninstall-watchdog|start-watchdog|stop-watchdog}"
+          echo "Platform: Windows (node-windows service + watchdog-v2)"
+          exit 1
+          ;;
+      esac
+      ;;
     *)
       echo "Error: Unsupported platform '$OS_TYPE'"
-      echo "Supported platforms: macOS (Darwin), Linux"
+      echo "Supported platforms: macOS (Darwin), Linux, Windows (Git Bash / MSYS / Cygwin)"
       exit 1
       ;;
   esac

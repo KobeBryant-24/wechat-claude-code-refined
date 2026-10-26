@@ -11,23 +11,30 @@ export interface SkillInfo {
 
 /**
  * Parse YAML-like frontmatter from a SKILL.md file.
- * Only extracts `name` and `description` fields.
+ * Only extracts `name` and `description` fields. Tolerant of CRLF line
+ * endings (Windows-saved files) by matching `\r?\n` between markers and
+ * stripping trailing `\r` from captured values.
  */
 function parseSkillMd(filePath: string): { name: string; description: string } | null {
   try {
     const content = readFileSync(filePath, 'utf-8');
-    const match = content.match(/^---\n([\s\S]*?)\n---/);
+    const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
     if (!match) return null;
 
     const frontmatter = match[1];
+    // With CRLF input, `(.+)$` (m flag) still stops at the LF, leaving a
+    // trailing \r on the captured value. Strip it explicitly.
+    const stripCr = (s: string) => s.replace(/\r$/, '');
     const nameMatch = frontmatter.match(/^name:\s*(.+)$/m);
     const descMatch = frontmatter.match(/^description:\s*(.+)$/m);
 
     if (!nameMatch) return null;
 
     return {
-      name: nameMatch[1].trim().replace(/^["']|["']$/g, ''),
-      description: descMatch ? descMatch[1].trim().replace(/^["']|["']$/g, '') : '',
+      name: stripCr(nameMatch[1]).trim().replace(/^["']|["']$/g, ''),
+      description: descMatch
+        ? stripCr(descMatch[1]).trim().replace(/^["']|["']$/g, '')
+        : '',
     };
   } catch {
     logger.warn(`Failed to read SKILL.md: ${filePath}`);

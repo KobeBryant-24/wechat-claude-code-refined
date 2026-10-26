@@ -12,10 +12,16 @@
     "test": "node --test dist/tests/*.test.js",
     "setup": "node dist/main.js setup",
     "daemon": "bash scripts/daemon.sh",
+    "daemon:reinstall": "node scripts/windows-service.cjs reinstall",
+    "daemon:restart": "node scripts/windows-service.cjs restart",
+    "daemon:pause": "node scripts/windows-service.cjs pause",
+    "daemon:resume": "node scripts/windows-service.cjs resume",
+    "redeploy": "npm run build && npm run daemon:restart",
     "visualize": "npx tsx src/tools/visualize-logs.ts"
   },
   "dependencies": {
-"qrcode": "^1.5.4",
+    "node-windows": "^1.0.0-beta.8",
+    "qrcode": "^1.5.4",
     "qrcode-terminal": "^0.12.0"
   },
   "devDependencies": {

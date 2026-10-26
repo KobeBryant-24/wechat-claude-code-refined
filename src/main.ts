@@ -1,7 +1,8 @@
 import { createInterface } from 'node:readline';
 import process from 'node:process';
-import { spawnSync } from 'node:child_process';
+import { spawnSync, spawn } from 'node:child_process';
 import { join, basename } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { unlinkSync, writeFileSync, mkdirSync, statSync, openSync, readSync, closeSync, existsSync, readdirSync, readFileSync, appendFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 
@@ -35,6 +36,106 @@ import { MessageType, type WeixinMessage } from './wechat/types.js';
 // Captured once at module load so `/status` uptime is anchored to daemon
 // startup, not to the most recent message.
 const SERVICE_STARTED_AT = Date.now();
+
+// ---------------------------------------------------------------------------
+// Death-trace: forensic log for every process exit path
+// ---------------------------------------------------------------------------
+//
+// Why a separate log file: when the daemon is hard-killed (Task Manager,
+// sc stop timeout — TerminateProcess, OOM, etc.) the main bridge log often
+// doesn't get a chance to flush. Writing each death event synchronously to
+// its own append-only file gives us a forensic trail showing WHO killed the
+// process (by capturing ppid + parent command line at the moment of death).
+//
+// The log is small (one line per death) so retention is bounded by
+// filesystem, not by the log framework. We never let death-log writes fail
+// the actual shutdown — wrapped in try/catch and uses appendFileSync so a
+// partial write still leaves the previous line intact.
+
+const DEATH_LOG_DIR = join(DATA_DIR, 'logs');
+
+// ---------------------------------------------------------------------------
+// Death detection
+// ---------------------------------------------------------------------------
+//
+// The Windows node-windows wrapper stops us via TerminateProcess (after its
+// SIGINT fallback fails), and TerminateProcess bypasses every signal handler
+// and the `exit` event in main.js. The only reliable way to capture "main.js
+// just died, here's why" is a SIBLING process that watches the parent and
+// writes the forensic record synchronously when it detects the parent gone.
+//
+// In-process SIGINT/SIGTERM/uncaughtException handlers are still useful for
+// dev (running under `npm start`) and for crashes Node actually catches —
+// they log additional detail (err.stack, signal name) that the monitor can't
+// see. But for the production Windows-service case, the monitor is
+// authoritative.
+
+function getDeathLogFilePath(dateStr: string, pid: number): string {
+  return join(DEATH_LOG_DIR, `death-${dateStr}-${pid}.log`);
+}
+
+function logDeath(kind: string, extra: Record<string, unknown> = {}): void {
+  try {
+    mkdirSync(DEATH_LOG_DIR, { recursive: true });
+    const now = new Date(Date.now() + 8 * 60 * 60 * 1000); // +08:00 local
+    const dateStr = now.toISOString().slice(0, 10);
+    const file = getDeathLogFilePath(dateStr, process.pid);
+    const ts = new Date().toISOString();
+    const payload = {
+      ts,
+      ts_local: now.toISOString(),
+      kind,
+      pid: process.pid,
+      ppid: process.ppid,
+      uptime_s: Math.round(process.uptime()),
+      exit_code: process.exitCode,
+      self_cmd: process.argv.slice(2).join(' ').slice(0, 500),
+      ...extra,
+    };
+    appendFileSync(file, JSON.stringify(payload) + '\n', 'utf-8');
+  } catch {
+    // Never let death-log write failures break the actual exit.
+  }
+}
+
+/**
+ * Spawn `scripts/death-monitor.cjs` as a detached sibling process. It polls
+ * `process.kill(parentPid, 0)` every 1s and writes
+ * `death-YYYY-MM-DD-{parentPid}.log` when the parent vanishes. Detached +
+ * unref'd so it inherits no handles and doesn't extend our event loop.
+ *
+ * Idempotent: returns the existing child's PID if already spawned (e.g. when
+ * runDaemon is called twice in the same process for tests).
+ */
+let _deathMonitorPid: number | undefined;
+function spawnDeathMonitor(): number | undefined {
+  if (_deathMonitorPid !== undefined) return _deathMonitorPid;
+  try {
+    // This project compiles to ESM, where `__dirname` does not exist —
+    // it has to be derived from the module URL.
+    const here = fileURLToPath(new URL('.', import.meta.url));
+    const scriptPath = join(here, '..', 'scripts', 'death-monitor.cjs');
+    const child = spawn(
+      process.execPath,
+      [scriptPath],
+      {
+        detached: true,
+        stdio: 'ignore',
+        windowsHide: true,
+        env: { ...process.env, WCC_PARENT_PID: String(process.pid) },
+      },
+    );
+    child.unref();
+    _deathMonitorPid = child.pid;
+    logger.info('Death monitor spawned', { monitorPid: child.pid, parentPid: process.pid });
+    return child.pid;
+  } catch (err) {
+    logger.warn('Failed to spawn death monitor', {
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return undefined;
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -178,25 +279,226 @@ function promptUser(question: string, defaultValue?: string): Promise<string> {
 /** Open a file using the platform's default application (secure: uses spawnSync) */
 function openFile(filePath: string): void {
   const platform = process.platform;
-  let cmd: string;
-  let args: string[];
+
+  // Build a list of open commands to try, in order. We always log the file
+  // path so the user can open it manually if every method fails. Errors are
+  // printed to console (not just logger) so they're visible during `setup`.
+  const candidates: Array<{ cmd: string; args: string[]; shell?: boolean }> = [];
 
   if (platform === 'darwin') {
-    cmd = 'open';
-    args = [filePath];
+    candidates.push({ cmd: 'open', args: [filePath] });
   } else if (platform === 'win32') {
-    cmd = 'cmd';
-    args = ['/c', 'start', '', filePath];
+    // `cmd /c start "" file` is the canonical way to open with the default
+    // app, but it sometimes fails when stdin is closed (which spawnSync
+    // does under stdio: 'ignore'). The `< NUL` redirect via shell-mode
+    // gives cmd a valid stdin. Explorer.exe is a more reliable fallback.
+    candidates.push({
+      cmd: 'cmd.exe',
+      args: [`/c start "" "${filePath}" <NUL`],
+      shell: true,
+    });
+    candidates.push({ cmd: 'explorer.exe', args: [filePath] });
   } else {
-    // Linux: try xdg-open
-    cmd = 'xdg-open';
-    args = [filePath];
+    candidates.push({ cmd: 'xdg-open', args: [filePath] });
   }
 
-  const result = spawnSync(cmd, args, { stdio: 'ignore' });
-  if (result.error) {
-    logger.warn('Failed to open file', { cmd, filePath, error: result.error.message });
+  for (const { cmd, args, shell } of candidates) {
+    const result = spawnSync(cmd, args, { stdio: 'ignore', shell });
+    if (!result.error && result.status === 0) {
+      return;
+    }
+    logger.warn('openFile attempt failed', {
+      cmd,
+      filePath,
+      error: result.error?.message,
+      status: result.status,
+      stderr: result.stderr?.toString().trim(),
+    });
   }
+
+  // All attempts failed — make sure the user can still get to the file.
+  console.error(`\n⚠️  无法自动打开图片，请手动打开：`);
+  console.error(`    ${filePath}\n`);
+}
+
+// ---------------------------------------------------------------------------
+// Singleton lock
+// ---------------------------------------------------------------------------
+
+/**
+ * Path to the singleton lock file. Holds the PID of the currently-running
+ * main.js. If a second main.js starts and finds a still-alive holder, it
+ * kills the holder (it's an orphan from a botched restart) before claiming
+ * the lock itself.
+ */
+const SINGLETON_LOCK_PATH = join(DATA_DIR, 'bridge.lock');
+
+function isProcessAlive(pid: number): boolean {
+  if (!Number.isFinite(pid) || pid <= 0) return false;
+  try {
+    // signal 0 only checks existence; doesn't actually deliver a signal.
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function killProcessTree(pid: number): void {
+  if (process.platform === 'win32') {
+    // /T = process tree, /F = force. Synchronous — by return, the PID is
+    // gone, so the new main.js can start polling iLink without a duplicate
+    // responder also polling.
+    spawnSync('taskkill', ['/T', '/F', '/PID', String(pid)], { stdio: 'ignore' });
+  } else {
+    process.kill(pid, 'SIGKILL');
+  }
+}
+
+/**
+ * Sweep all OTHER `dist/main.js` node.exe processes on the box and kill them.
+ * The single-PID lock-file reap above only catches the most recent orphan —
+ * but node-windows wrappers (the SCM-spawned `--file dist/main.js` parents)
+ * survive SIGTERM and continue to re-fork new main.js children every `wait`
+ * seconds. Those children never get their PID into the lock file, so the
+ * lock-file reap misses them and they pile up.
+ *
+ * The sweep enumerates via wmic, filters by commandline containing
+ * `dist/main.js`, and taskkills everything except our own PID. Runs once
+ * per startup, before we claim the lock — so any zombie that re-forks
+ * between our sweep and another instance's startup will be caught on the
+ * next sweep.
+ */
+function reapZombieMainJsInstances(myPid: number): number {
+  if (process.platform !== 'win32') return 0;
+
+  // wmic is deprecated but still works on Win 10/11 and the alternative
+  // (Get-CimInstance via powershell) takes 500ms+ to start. Use wmic and
+  // accept the deprecation warning; the /format:list output is also easier
+  // to parse than CSV when commandlines contain commas.
+  const result = spawnSync('wmic', [
+    'process', 'where',
+    "name='node.exe'",
+    'get', 'ProcessId,CommandLine',
+    '/format:list',
+  ], { encoding: 'utf8', timeout: 10_000 });
+
+  if (result.status !== 0 || !result.stdout) {
+    logger.warn('Zombie sweep: wmic query failed', {
+      status: result.status,
+      stderr: result.stderr?.slice(0, 200),
+    });
+    return 0;
+  }
+
+  // /format:list emits blocks separated by blank lines:
+  //   CommandLine=...
+  //   ProcessId=1234
+  //   (blank)
+  //   CommandLine=...
+  //   ProcessId=5678
+  const blocks = result.stdout.split(/\r?\n\r?\n/);
+
+  // The wrappers survive `sc stop` and SIGTERM, then re-fork a new main.js
+  // every `--wait N` seconds. Killing just the leftover main.js processes
+  // is futile: the wrapper instantly spawns a replacement. We have to kill
+  // the WRAPPER itself, and `taskkill /T /F` then transitively kills the
+  // child main.js it spawned. We exclude our own parent wrapper (the one
+  // that forked us) so the sweep doesn't commit suicide.
+  const myPpid = process.ppid;
+  const zombies: number[] = [];
+  for (const block of blocks) {
+    const cmdMatch = block.match(/^CommandLine=(.*)$/m);
+    const pidMatch = block.match(/^ProcessId=(\d+)$/m);
+    if (!cmdMatch || !pidMatch) continue;
+    const pid = parseInt(pidMatch[1], 10);
+    const cmdline = cmdMatch[1];
+    if (pid === myPid) continue;
+
+    const isOurMainJs = /dist[/\\]main\.js/.test(cmdline);
+    const isOurWrapper = /node-windows[/\\]lib[/\\]wrapper\.js/.test(cmdline)
+      && /dist[/\\]main\.js/.test(cmdline);
+    if (!isOurMainJs && !isOurWrapper) continue;
+    if (isOurWrapper && pid === myPpid) continue; // keep our own parent
+    zombies.push(pid);
+  }
+
+  let killed = 0;
+  for (const pid of zombies) {
+    const r = spawnSync('taskkill', ['/T', '/F', '/PID', String(pid)], { stdio: 'ignore' });
+    if (r.status === 0) killed++;
+  }
+  return killed;
+}
+
+/**
+ * Ensure only one main.js runs at a time across restarts.
+ *
+ * The Windows service lifecycle: `sc stop` — node-windows wrapper calls
+ * process.exit() in its stop handler — wrapper dies, but main.js (its child
+ * fork) may not be reaped synchronously and lingers as an orphan. The
+ * watchdog then starts a new wrapper, which forks a fresh main.js, and
+ * now both are polling iLink — producing duplicate replies.
+ *
+ * Before doing anything else, the new main.js reaps any still-alive holder
+ * of the singleton lock. The lock is then claimed for this PID and released
+ * on graceful exit. On crash, the next startup's `isProcessAlive` check
+ * detects the stale holder and reaps it.
+ */
+function acquireSingletonLock(): { reapedOrphanAt?: number } {
+  mkdirSync(DATA_DIR, { recursive: true });
+
+  let oldPid = 0;
+  try {
+    const contents = readFileSync(SINGLETON_LOCK_PATH, 'utf8').trim();
+    oldPid = parseInt(contents, 10);
+  } catch {
+    // No lock file — first run, or a previous crash before the lock was
+    // ever written. Nothing to reap.
+  }
+
+  let reapedOrphanAt: number | undefined;
+  if (oldPid && oldPid !== process.pid && isProcessAlive(oldPid)) {
+    logger.warn('Reaping orphan main.js from previous run before claiming singleton lock', { oldPid });
+    killProcessTree(oldPid);
+    reapedOrphanAt = Date.now();
+    // Give the kernel a beat to actually deliver the kill. The taskkill
+    // call is synchronous in the sense that it returns after the Win32
+    // TerminateProcess call, but the OS scheduler still needs a moment to
+    // tear down the iLink connection. 250ms is plenty on a quiet system.
+    spawnSync(process.platform === 'win32' ? 'ping' : 'true',
+      process.platform === 'win32' ? ['-n', '1', '127.0.0.1'] : [],
+      { stdio: 'ignore' });
+  }
+
+  // Sweep ALL other dist/main.js processes. The lock-file reap above only
+  // catches the most recent orphan — but node-windows wrappers survive
+  // SIGTERM and continue to re-fork new main.js children every `wait`
+  // seconds, so several stale main.js children can be running in parallel,
+  // each of them polling iLink independently and producing duplicate
+  // replies. wmic them all here, then claim the lock.
+  const killedZombies = reapZombieMainJsInstances(process.pid);
+  if (killedZombies > 0) {
+    logger.warn('Zombie sweep killed stray dist/main.js instances', { killedZombies });
+  }
+
+  writeFileSync(SINGLETON_LOCK_PATH, String(process.pid));
+
+  const release = () => {
+    try {
+      if (existsSync(SINGLETON_LOCK_PATH) &&
+          readFileSync(SINGLETON_LOCK_PATH, 'utf8').trim() === String(process.pid)) {
+        unlinkSync(SINGLETON_LOCK_PATH);
+      }
+    } catch {
+      // best-effort cleanup; a stale lock just gets reaped next startup.
+    }
+  };
+  // 'exit' fires on normal exit and on signals we handle, but NOT on
+  // SIGKILL/TerminateProcess — which is exactly when we WANT the next
+  // startup to reap us.
+  process.on('exit', release);
+  return { reapedOrphanAt };
 }
 
 // ---------------------------------------------------------------------------
@@ -227,7 +529,7 @@ async function runSetup(): Promise<void> {
         console.log();
       } catch {
         logger.warn('qrcode-terminal not available, falling back to URL');
-        console.log('无法在终端显示二维码，请访问链接：');
+        console.log('无法在终端显示二维码，请访问链接。');
         console.log(qrcodeUrl);
         console.log();
       }
@@ -238,7 +540,7 @@ async function runSetup(): Promise<void> {
       writeFileSync(QR_PATH, pngData);
 
       openFile(QR_PATH);
-      console.log('已打开二维码图片，请用微信扫描：');
+      console.log('已打开二维码图片，请用微信扫描。');
       console.log(`图片路径: ${QR_PATH}\n`);
     }
 
@@ -250,7 +552,7 @@ async function runSetup(): Promise<void> {
       break;
     } catch (err: any) {
       if (err.message?.includes('expired')) {
-        console.log('⚠️ 二维码已过期，正在刷新...\n');
+        console.log('⚠️ 二维码已过期，正在刷新..\n');
         continue;
       }
       throw err;
@@ -275,6 +577,21 @@ async function runSetup(): Promise<void> {
 // ---------------------------------------------------------------------------
 
 async function runDaemon(): Promise<void> {
+  // Spawn the death-monitor sibling FIRST so it has the freshest possible
+  // parent PID to watch. The monitor polls every 1s and writes a forensic
+  // record to death-{date}-{pid}.log the moment this process disappears —
+  // including the Windows-service TerminateProcess case that bypasses every
+  // signal handler we register below.
+  spawnDeathMonitor();
+
+  // Singleton guard runs BEFORE any other initialization. If a previous
+  // main.js is still running (orphan from a botched wrapper shutdown), it
+  // gets killed here before we start polling iLink — otherwise two main.js
+  // processes would both reply to incoming messages. The reap timestamp is
+  // captured and later stamped on the session so the auto-resume safety
+  // guard can detect a recent crash loop.
+  const { reapedOrphanAt } = acquireSingletonLock();
+
   const config = loadConfig();
   const account = loadLatestAccount();
 
@@ -324,6 +641,15 @@ async function runDaemon(): Promise<void> {
     sessionStore.save(account.accountId, session);
   }
 
+  // Record the singleton-lock reap (if any) on the session so the
+  // auto-resume safety guard can refuse `auto` in a crash-loop window.
+  if (reapedOrphanAt) {
+    session.lastOrphanReapAt = reapedOrphanAt;
+    sessionStore.save(account.accountId, session);
+    logger.warn('Marked session: orphan reaped at startup', {
+      lastOrphanReapAt: reapedOrphanAt,
+    });
+  }
 
   // Auto-resume consultation: on every fresh daemon spawn (i.e. immediately
   // after restart, redeploy, or fresh start), if we have a Claude session to
@@ -434,6 +760,50 @@ async function runDaemon(): Promise<void> {
     process.exit(0);
   }
 
+  // Death detection: in-process signal/exit handlers catch the cases where
+  // Node actually delivers a signal (dev mode, Ctrl+C, uncaught exceptions).
+  // The sibling death-monitor process (spawned at the top of runDaemon) is
+  // the authoritative detector for the Windows-service case, where the
+  // node-windows wrapper uses TerminateProcess and bypasses these handlers
+  // entirely. Both write to the same per-PID log file.
+  process.on('SIGINT', () => {
+    logDeath('SIGINT', { signal: 'SIGINT' });
+    shutdown();
+  });
+  process.on('SIGTERM', () => {
+    logDeath('SIGTERM', { signal: 'SIGTERM' });
+    shutdown();
+  });
+  // SIGHUP doesn't fire on Windows in normal node usage, but we register it
+  // anyway for completeness (e.g. when running under Git Bash / WSL wrappers).
+  process.on('SIGHUP', () => {
+    logDeath('SIGHUP', { signal: 'SIGHUP' });
+    shutdown();
+  });
+  process.on('exit', (code) => {
+    logDeath('exit', { exit_code: code });
+  });
+
+  // Last-line-of-defense error handlers. Without these, a single stray
+  // promise rejection or synchronous throw inside a streaming handler (e.g.
+  // a Claude CLI child process closing its stdout mid-turn) tears down the
+  // entire daemon, which in turn makes the node-windows wrapper exit -1 and
+  // the SCM marks the service STOPPED — every WeChat session silently goes
+  // dark until someone manually restarts the service. Log + survive so the
+  // next user message can still be handled.
+  process.on('unhandledRejection', (reason) => {
+    const err = reason instanceof Error ? (reason.stack ?? reason.message) : String(reason);
+    logDeath('unhandledRejection', { reason: err });
+    logger.error('Unhandled promise rejection', { error: err });
+  });
+  process.on('uncaughtException', (err) => {
+    logDeath('uncaughtException', {
+      error: err.stack ?? err.message,
+      name: err.name,
+    });
+    logger.error('Uncaught exception', { error: err.stack ?? err.message });
+  });
+
   // Sweep snippets past their 7-day retention. Best-effort: a stale directory
   // must never keep the daemon from starting.
   try {
@@ -446,8 +816,6 @@ async function runDaemon(): Promise<void> {
       error: err instanceof Error ? err.message : String(err),
     });
   }
-  process.on('SIGINT', shutdown);
-  process.on('SIGTERM', shutdown);
 
   logger.info('Daemon started', { accountId: account.accountId });
   console.log(`已启动 (账号: ${account.accountId})`);
