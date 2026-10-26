@@ -22,6 +22,23 @@ export interface Session {
   state: SessionState;
   chatHistory: ChatMessage[];
   maxHistoryLength?: number;
+  /**
+   * Whether this session collects a turn's output and delivers it as one
+   * unit instead of streaming it piece by piece.
+   *
+   * `true`  — collect, then send the messages themselves if the turn was
+   *           short and quick, or a summary plus a file otherwise. Costs 2
+   *           messages of the user's outbound budget no matter how much
+   *           was produced.
+   * `false` — stream each piece as it arrives. The turn can produce more
+   *           messages than the budget allows; the overflow waits in the
+   *           queue and goes out when the user writes again.
+   * unset  — inherit the service-level default (off unless changed).
+   *
+   * Remembered per session, so `/compact-msg on` applies to the
+   * conversation you are in and keeps applying to it.
+   */
+  compactMsg?: boolean;
 }
 
 const DEFAULT_MAX_HISTORY = 100;
@@ -70,6 +87,9 @@ export function createSessionStore() {
       previousSdkSessionId: undefined,
       workingDirectory: currentSession?.workingDirectory ?? DEFAULT_WORKING_DIR,
       model: currentSession?.model,
+      // The delivery preference survives a /clear: it is a property of the
+      // channel, not of the conversation that was cleared.
+      compactMsg: currentSession?.compactMsg,
       state: 'idle',
       chatHistory: [],
       maxHistoryLength: currentSession?.maxHistoryLength || DEFAULT_MAX_HISTORY,

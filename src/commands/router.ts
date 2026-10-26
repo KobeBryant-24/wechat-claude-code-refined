@@ -23,6 +23,16 @@ export interface CommandResult {
   claudePrompt?: string;
   sendFile?: string; // Absolute path to a file to send to the user
   /**
+   * Resume the current SDK session and let the assistant continue.
+   *
+   * The caller runs it — a continuation needs the sender, the session store,
+   * and the abort controllers, none of which the command context carries.
+   * It is deliberately *not* a `claudePrompt`: a continuation must not
+   * overwrite the session's `lastUserQuery`, because that records what the
+   * user actually asked.
+   */
+  continueSession?: boolean;
+  /**
    * Deliver this reply ahead of whatever is still queued for the user.
    *
    * A command reply is the user waiting for an answer to a question they

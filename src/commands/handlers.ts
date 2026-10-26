@@ -13,6 +13,7 @@ const HELP_TEXT = `可用命令：
 会话管理：
   /help             显示帮助
   /stop             停止当前对话并清空排队消息
+  /continue         继续上次未完成的对话（额度用完时续发剩余内容）
   /clear            清除当前会话
   /reset            完全重置（包括工作目录等设置）
   /status           查看当前会话状态
@@ -28,6 +29,7 @@ const HELP_TEXT = `可用命令：
   /cwd [路径]       查看或切换工作目录
   /model [名称]     查看或切换 Claude 模型
   /prompt [内容]    查看或设置系统提示词（全局生效）
+  /compact-msg on|off  整合消息开关（按会话记忆）
 
 其他：
   /skills [full]    列出已安装的 skill（full 显示描述）
@@ -84,6 +86,7 @@ export function handleModel(ctx: CommandContext, args: string): CommandResult {
 export function handleStatus(ctx: CommandContext): CommandResult {
   const s = ctx.session;
   const pending = ctx.getPendingCount?.() ?? 0;
+  const compact = s.compactMsg ?? loadConfig().compactMsg ?? false;
   const lines = [
     '📊 会话状态',
     '',
@@ -91,6 +94,7 @@ export function handleStatus(ctx: CommandContext): CommandResult {
     `模型: ${s.model ?? '默认'}`,
     `会话ID: ${s.sdkSessionId ?? '无'}`,
     `状态: ${s.state}`,
+    `整合消息: ${compact ? '开启' : '关闭'}`,
     `待发消息: ${pending}${pending > 0 ? '（额度用完时在排队，回复任意消息即可续发）' : ''}`,
   ];
   return { reply: lines.join('\n'), handled: true, priority: true };
@@ -130,6 +134,9 @@ export function handleHistory(ctx: CommandContext, args: string): CommandResult 
 export function handleReset(ctx: CommandContext): CommandResult {
   const newSession = ctx.clearSession();
   newSession.workingDirectory = DEFAULT_WORKING_DIR;
+  // A full reset drops the per-session delivery preference too, so the
+  // session goes back to inheriting the service-level default.
+  newSession.compactMsg = undefined;
   Object.assign(ctx.session, newSession);
   return { reply: '✅ 会话已完全重置，所有设置恢复默认。', handled: true };
 }
@@ -177,6 +184,77 @@ export function handleVersion(): CommandResult {
     return { reply: 'wechat-claude-code (version unknown)', handled: true, priority: true };
   }
 }
+
+/**
+ * `/compact-msg on|off` — how this session delivers a turn's output.
+ *
+ * On: the turn is collected and delivered as one unit. A short, quick turn
+ * goes out as its own messages, in the order they were produced; anything
+ * longer or slower goes out as a summary plus a file. Either way the turn
+ * costs 2 messages of the user's budget instead of however many it happened
+ * to produce.
+ *
+ * Off: each piece goes out as it is produced. The turn can produce more
+ * messages than iLink's 10-message budget allows; the overflow waits in the
+ * queue and goes out when the user writes again — which is what `/continue`
+ * is for.
+ *
+ * The setting is remembered per session, so it keeps applying to this
+ * conversation. `default on|off` changes the service-level default that
+ * sessions which have not chosen inherit.
+ */
+export function handleCompactMsg(ctx: CommandContext, args: string): CommandResult {
+  const arg = args.trim().toLowerCase();
+  const config = loadConfig();
+
+  if (arg.startsWith('default')) {
+    const sub = arg.replace(/^default\s*/, '').trim();
+    if (sub !== 'on' && sub !== 'off') {
+      return {
+        reply: '用法: /compact-msg default on | default off\n设置未被单独指定过的会话所继承的默认值。',
+        handled: true,
+      };
+    }
+    config.compactMsg = sub === 'on';
+    saveConfig(config);
+    return {
+      reply: `✅ 服务默认已设为：${sub === 'on' ? '开启' : '关闭'}\n` +
+        `未被单独设置的会话将继承这个默认值。`,
+      handled: true,
+    };
+  }
+
+  if (arg === 'on' || arg === 'off') {
+    ctx.updateSession({ compactMsg: arg === 'on' });
+    return {
+      reply: arg === 'on'
+        ? '✅ 已开启整合消息（compact-msg）\n' +
+          '本会话之后：回复先整合，超过 4 条或耗时超过 30 秒时改为「摘要 + 附件」。'
+        : '✅ 已关闭整合消息（compact-msg）\n' +
+          '本会话之后：回复实时分段发送，额度用完时用 /continue 续发。',
+      handled: true,
+    };
+  }
+
+  if (arg && arg !== 'status') {
+    return {
+      reply: '用法: /compact-msg on | off | status | default on | default off',
+      handled: true,
+    };
+  }
+
+  const effective = ctx.session.compactMsg ?? config.compactMsg ?? false;
+  const scope = ctx.session.compactMsg !== undefined
+    ? '本会话设置'
+    : '服务默认';
+  return {
+    reply: `📦 整合消息（compact-msg）：${effective ? '开启' : '关闭'}（来源：${scope}）\n` +
+      `开启后：回复先整合，≤4 条且 ≤30 秒直接发送，否则发「摘要 + 附件」。\n` +
+      `关闭后：实时分段发送，额度用完用 /continue 续发。`,
+    handled: true,
+  };
+}
+
 /**
  * `/stop` when nothing is running.
  *
@@ -186,6 +264,33 @@ export function handleVersion(): CommandResult {
  */
 export function handleStop(_ctx: CommandContext): CommandResult {
   return { reply: 'ℹ️ 当前没有进行中的对话。', handled: true, priority: true };
+}
+
+/**
+ * `/continue` — pick the conversation back up.
+ *
+ * The usual reason to send it: the turn's 10-message budget ran out and the
+ * tail of the answer is still queued. Sending this message is itself what
+ * releases that backlog — the user's message refills their budget — and it
+ * also asks the assistant to continue the work it was doing.
+ */
+export function handleContinue(ctx: CommandContext, _args: string): CommandResult {
+  if (ctx.session.state === 'processing') {
+    return {
+      reply: '⚠️ 当前还有一轮对话在进行中。\n先用 /stop 停止它，再回复 /continue。',
+      handled: true,
+    };
+  }
+  if (!ctx.session.sdkSessionId) {
+    return {
+      reply: '⚠️ 当前没有可续接的会话。\n直接发一条消息开始新会话即可。',
+      handled: true,
+    };
+  }
+  // The actual continuation is run by the caller — it needs the sender, the
+  // abort controllers, and the session store, none of which the command
+  // context carries.
+  return { handled: true, continueSession: true };
 }
 
 

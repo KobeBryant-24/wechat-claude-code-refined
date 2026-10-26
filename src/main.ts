@@ -16,8 +16,8 @@ import { routeCommand, type CommandContext, type CommandResult } from './command
 import { claudeQuery, type QueryOptions } from './claude/provider.js';
 import { TurnRouter } from './claude/turn-router.js';
 import { cleanupExpiredSnippets } from './claude/snippet-store.js';
-import { filterToolNoise } from './claude/tool-noise-filter.js';
-import { loadConfig, saveConfig } from './config.js';
+import { createNormalSink, createCompactSink, type TurnSink, type SinkOptions } from './claude/turn-sink.js';
+import { loadConfig, saveConfig, type Config } from './config.js';
 import { logger } from './logger.js';
 import { DATA_DIR } from './constants.js';
 import { MessageType, type WeixinMessage } from './wechat/types.js';
@@ -26,7 +26,6 @@ import { MessageType, type WeixinMessage } from './wechat/types.js';
 // Helpers
 // ---------------------------------------------------------------------------
 
-const MAX_MESSAGE_LENGTH = 4000;
 
 // Extensions eligible for auto-push when detected in Claude's response
 const AUTO_PUSH_EXTENSIONS = new Set([
@@ -53,82 +52,17 @@ function extractFilePathsFromText(text: string, cwd: string): string[] {
   return paths;
 }
 
-/** Split text into blocks at paragraph boundaries (double newlines). */
-function parseBlocks(text: string): string[] {
-  return text.split(/\n\n+/).filter(block => block.length > 0);
-}
-
-/** Find a safe split point that won't break markdown formatting. */
-function findSafeSplitPoint(text: string, maxLen: number): number {
-  // Try newline first (preserves list items, paragraphs)
-  let idx = text.lastIndexOf('\n', maxLen);
-  if (idx >= maxLen * 0.3) return idx;
-
-  // Try sentence-ending punctuation
-  const sentenceEnd = /[。！？.!?]$/;
-  for (let i = maxLen; i >= maxLen * 0.5; i--) {
-    if (sentenceEnd.test(text.slice(i - 1, i))) return i;
-  }
-
-  // Try space (won't split mid-word or mid-markdown)
-  idx = text.lastIndexOf(' ', maxLen);
-  if (idx >= maxLen * 0.3) return idx;
-
-  // Last resort: hard cut
-  return maxLen;
-}
-
-/** Fallback: split a single oversized block at safe boundaries. */
-function splitByNewline(text: string, maxLen: number): string[] {
-  const chunks: string[] = [];
-  let remaining = text;
-  while (remaining.length > 0) {
-    if (remaining.length <= maxLen) {
-      chunks.push(remaining);
-      break;
-    }
-    const splitIdx = findSafeSplitPoint(remaining, maxLen);
-    chunks.push(remaining.slice(0, splitIdx));
-    remaining = remaining.slice(splitIdx).replace(/^\n+/, '');
-  }
-  return chunks;
-}
-
 /**
- * Card-aware message splitter.
- * Splits at paragraph boundaries (double newlines) to keep cards intact,
- * falls back to newline-based splitting for oversized single blocks.
+ * Message splitting lives in `wechat/split.ts`.
+ *
+ * The copy that used to live here split on paragraph boundaries only. That
+ * was not enough: iLink's limit is on *bytes*, and 4000 characters of
+ * Chinese or emoji crosses it — a chunk that does is rejected with the same
+ * `ret:-2` an exhausted quota produces, so the two are indistinguishable at
+ * the send site. The shared splitter cuts on both characters and bytes, and
+ * the compact path uses the same one so "how many messages is this" means
+ * the same thing to the threshold check as it does to the budget.
  */
-function splitMessage(text: string, maxLen: number = MAX_MESSAGE_LENGTH): string[] {
-  if (text.length <= maxLen) return [text];
-  const blocks = parseBlocks(text);
-  const chunks: string[] = [];
-  let current = '';
-
-  for (const block of blocks) {
-    // Can this block fit into the current chunk?
-    if (current.length === 0) {
-      if (block.length <= maxLen) {
-        current = block;
-      } else {
-        chunks.push(...splitByNewline(block, maxLen));
-      }
-    } else if (current.length + 2 + block.length <= maxLen) {
-      current += '\n\n' + block;
-    } else {
-      // Current chunk is complete, start a new one
-      chunks.push(current);
-      if (block.length <= maxLen) {
-        current = block;
-      } else {
-        chunks.push(...splitByNewline(block, maxLen));
-        current = '';
-      }
-    }
-  }
-  if (current) chunks.push(current);
-  return chunks;
-}
 
 function promptUser(question: string, defaultValue?: string): Promise<string> {
   return new Promise((resolve) => {
@@ -425,7 +359,10 @@ async function handleMessage(
       accountId: account.accountId,
       session,
       updateSession,
-      clearSession: () => sessionStore.clear(account.accountId),
+      // Pass the current session so the settings that belong to the channel
+      // rather than to the conversation — the delivery preference — survive
+      // a /clear.
+      clearSession: () => sessionStore.clear(account.accountId, session),
       getChatHistoryText: (limit?: number) => sessionStore.getChatHistoryText(session, limit),
       getPendingCount: () => sender.pendingCount(fromUserId),
       text: userText,
@@ -451,6 +388,18 @@ async function handleMessage(
         result.claudePrompt, imageItem, fileItem, fromUserId, contextToken,
         account, session, sessionStore, sender, config, activeControllers,
       );
+      return;
+    }
+
+    if (result.handled && result.continueSession) {
+      // /continue. The user's message already refilled the budget and
+      // released the previous turn's backlog (see flushPending above); this
+      // asks the assistant to carry on with the work it was doing.
+      await runSessionContinuation({
+        account, session, sessionStore, sender, config, activeControllers,
+        trigger: 'manual',
+        contextToken,
+      });
       return;
     }
 
@@ -505,6 +454,252 @@ function flushPending(
   sender.noteInbound(toUserId, contextToken);
 }
 
+// ---------------------------------------------------------------------------
+// Message emission
+// ---------------------------------------------------------------------------
+//
+// The emission logic lives in `claude/turn-sink.ts` now. It used to sit
+// here, duplicated between the normal turn path and the auto-resume path —
+// two near-identical copies of the same emit/deliver behaviour, free to
+// drift apart. The sinks keep one copy and make the choice between
+// "stream it" and "collect it, then deliver as one unit" explicit.
+//
+//   createNormalSink  — each piece goes out as it arrives
+//   createCompactSink — hold everything, then send it as one unit
+//
+/**
+ * Pick the sink a turn should use.
+ *
+ * The normal sink streams each piece out as it arrives — that is what makes
+ * an agent loop feel alive. The compact sink holds everything until the turn
+ * ends and then delivers it as one unit: either the messages themselves, or
+ * a summary plus a file. That is the mode that survives a 10-message
+ * outbound budget, because it costs 2 messages instead of however many the
+ * turn happened to produce.
+ *
+ * The choice is per session, and it is remembered per session: `/compact-msg
+ * on` turns it on for the conversation you are in now, and it stays on for
+ * that conversation.
+ */
+function createTurnSink(opts: SinkOptions & { compact: boolean }): TurnSink {
+  return opts.compact ? createCompactSink(opts) : createNormalSink(opts);
+}
+
+/**
+ * Whether this session delivers its replies through the compact sink.
+ *
+ * The setting is remembered per session — `/compact-msg on` turns it on for
+ * the conversation you are in, and it stays on for that conversation. A
+ * session that has never been told either way inherits the service-level
+ * default, so the whole service can be switched over without rewriting
+ * every session file. The default is off.
+ */
+function isCompactEnabled(session: Session, config: Config): boolean {
+  return session.compactMsg ?? config.compactMsg ?? false;
+}
+
+// ---------------------------------------------------------------------------
+// Session continuation
+// ---------------------------------------------------------------------------
+
+/**
+ * Who asked for the continuation.
+ *
+ * `auto` — the startup consultation decided the previous turn was cut off
+ *   and the user wanted it finished. Nobody is waiting for a reply.
+ * `manual` — the user sent `/continue`, usually because the outbound budget
+ *   ran out mid-answer and the tail of the reply is still queued.
+ */
+type ContinuationTrigger = 'auto' | 'manual';
+
+interface ContinuationOptions {
+  account: AccountData;
+  session: Session;
+  sessionStore: ReturnType<typeof createSessionStore>;
+  sender: ReturnType<typeof createSender>;
+  config: ReturnType<typeof loadConfig>;
+  activeControllers: Map<string, AbortController>;
+  trigger: ContinuationTrigger;
+  /**
+   * The context token to reply under.
+   *
+   * The startup path has no inbound message to borrow one from, so it
+   * replies with an empty token. The manual path passes the token the
+   * user's `/continue` arrived with.
+   */
+  contextToken?: string;
+}
+
+/**
+ * Fire an SDK query that resumes the existing `sdkSessionId` and asks the
+ * assistant to continue whatever was interrupted.
+ *
+ * Two callers:
+ *
+ *   - the startup consultation, when the LLM (after passing the safety
+ *     guards) decides the previous turn was cut off mid-tool and the user
+ *     clearly wanted it completed;
+ *   - `/continue`, when the user asks for the rest of an answer the
+ *     outbound budget cut short.
+ *
+ * The result is delivered through the same per-user worker queue as a normal
+ * user reply, so the outbound budget, pacing, and chunk-splitting are
+ * honored identically — and so is compact mode: the continuation goes
+ * through whichever sink the session is configured for, which is what keeps
+ * auto-resume working when compact-msg is on.
+ *
+ * No userText/imageItem/fileItem is involved — this is a synthetic follow-up
+ * message ("请继续上次没做完的工作。") injected into the existing session. The
+ * session's `lastUserQuery` is preserved untouched: it records what the user
+ * actually asked, and a continuation is not an answer to anything.
+ */
+async function runSessionContinuation(opts: ContinuationOptions): Promise<void> {
+  const { account, session, sessionStore, sender, config, activeControllers, trigger } = opts;
+  const contextToken = opts.contextToken ?? '';
+  const label = trigger === 'auto' ? 'Auto-resume' : 'Continue';
+
+  if (!session.sdkSessionId) {
+    logger.warn(`${label}: no sdkSessionId, skipping fire`, {
+      accountId: account.accountId,
+    });
+    if (trigger === 'manual') {
+      sender.enqueue(account.userId, contextToken, '⚠️ 当前没有可续接的会话，先发一条消息开始新会话。', 'final');
+    }
+    return;
+  }
+
+  // Mark processing so any user message that arrives during the resume
+  // gets routed through the normal abort path (line 558: a new message
+  // aborts the active controller before being processed itself).
+  session.state = 'processing';
+  sessionStore.save(account.accountId, session);
+
+  const abortController = new AbortController();
+  activeControllers.set(account.accountId, abortController);
+
+  const stopTyping = sender.startTyping(account.userId, contextToken);
+
+  try {
+    let anySent = false;
+    const sink = createTurnSink({
+      sender,
+      toUserId: account.userId,
+      contextToken,
+      cwd: (session.workingDirectory || config.workingDirectory).replace(/^~/, homedir()),
+      model: session.model,
+      abortController,
+      compact: isCompactEnabled(session, config),
+      onAccepted: () => { anySent = true; },
+    });
+    const router = new TurnRouter((msg) => sink.emit(msg.text, msg.role));
+
+    const queryOptions: QueryOptions = {
+      // Synthetic prompt. The SDK will append this to the existing JSONL
+      // (because we pass `resume`) and the assistant sees its own previous
+      // (incomplete) turn + this new "continue" message, which is the
+      // standard continuation pattern.
+      prompt: '请继续上次没做完的工作。',
+      cwd: (session.workingDirectory || config.workingDirectory).replace(/^~/, homedir()),
+      resume: session.sdkSessionId,
+      model: session.model,
+      systemPrompt: [
+        '你正在通过微信与用户对话，不是在终端里。不要让用户去终端操作。如果用户需要文件，直接输出文件地址就行，会自动识别解析推送文件到用户的微信中。',
+        config.systemPrompt,
+      ].filter(Boolean).join('\n'),
+      abortController,
+      onText: (delta: string) => router.onText(delta),
+      onTurnEnd: (stopReason: string) => router.onTurnEnd(stopReason),
+    };
+
+    logger.info(`${label}: firing SDK query`, {
+      sessionId: session.sdkSessionId,
+      cwd: queryOptions.cwd,
+    });
+
+    const startedAt = Date.now();
+    let result = await claudeQuery(queryOptions);
+
+    if (result.error && queryOptions.resume) {
+      logger.warn(`${label}: resume failed, retrying without resume`, {
+        error: result.error,
+        sessionId: queryOptions.resume,
+      });
+      queryOptions.resume = undefined;
+      session.sdkSessionId = undefined;
+      sessionStore.save(account.accountId, session);
+      const retryResult = await claudeQuery(queryOptions);
+      Object.assign(result, retryResult);
+    }
+    const elapsedMs = Date.now() - startedAt;
+
+    router.drain();
+
+    if (result.text) {
+      if (result.error) {
+        logger.warn(`${label}: Claude query had error but returned text, using text`, {
+          error: result.error,
+        });
+      }
+      sessionStore.addChatMessage(session, 'assistant', result.text);
+    }
+
+    // The sink owns delivery: it knows whether anything was streamed, and
+    // whether the turn has to be compacted instead of sent as-is.
+    await sink.deliver({
+      finalText: result.text,
+      elapsedMs,
+      aborted: abortController.signal.aborted,
+    });
+
+    if (!result.text) {
+      if (result.error) {
+        logger.error(`${label}: Claude query error`, { error: result.error });
+        sender.enqueue(
+          account.userId, contextToken,
+          trigger === 'auto' ? '（自动续接失败，可回复"继续"再试一次）' : '（续接失败，可稍后重试）',
+          'final',
+        );
+      } else if (!anySent) {
+        sender.enqueue(
+          account.userId, contextToken,
+          trigger === 'auto' ? '（自动续接完成，没有新内容）' : '（续接完成，没有新内容）',
+          'final',
+        );
+      }
+    }
+
+    // Update SDK session id in case it rotated (e.g. retry without resume).
+    session.sdkSessionId = result.sessionId || undefined;
+    session.state = 'idle';
+    sessionStore.save(account.accountId, session);
+  } catch (err) {
+    const isAbort = err instanceof Error && (err.name === 'AbortError' || err.message.includes('abort'));
+    if (isAbort) {
+      logger.info(`${label}: aborted by new message`);
+    } else {
+      const errorMsg = err instanceof Error ? err.message : String(err);
+      logger.error(`${label}: error`, { error: errorMsg });
+      sender.enqueue(
+        account.userId, contextToken,
+        trigger === 'auto' ? '（自动续接出错，可回复"继续"手动续）' : '（续接出错，可稍后重试）',
+        'final',
+      );
+    }
+    session.state = 'idle';
+    sessionStore.save(account.accountId, session);
+  } finally {
+    stopTyping();
+    if (session.state !== 'idle') {
+      session.state = 'idle';
+      sessionStore.save(account.accountId, session);
+    }
+    if (activeControllers.get(account.accountId) === abortController) {
+      activeControllers.delete(account.accountId);
+    }
+  }
+}
+
+
 async function sendToClaude(
   userText: string,
   imageItem: ReturnType<typeof extractFirstImageUrl>,
@@ -527,7 +722,6 @@ async function sendToClaude(
   activeControllers.set(account.accountId, abortController);
 
   // Flush timer for streaming text to WeChat during query (declared here for finally cleanup)
-  let flushTimer: ReturnType<typeof setInterval> | undefined;
 
   // Record user message in chat history
   sessionStore.addChatMessage(session, 'user', userText || '(图片)');
@@ -570,71 +764,29 @@ async function sendToClaude(
     }
 
     let anySent = false;
-    let lastSentTime = Date.now();
-    let pendingRetry: { text: string; role: 'interstitial' | 'final' } | null = null;
 
-    // Serial promise chain — each emit appends to the chain, no flags needed
-    let flushChain: Promise<void> = Promise.resolve();
+    // Replies flow through a sink. The normal sink streams each piece as it
+    // arrives; the compact sink holds everything until the turn ends and
+    // then delivers it as one unit — the messages themselves, or a summary
+    // plus a file. The worker underneath owns send cadence, the outbound
+    // budget, and chunk-level retry either way.
+    //
+    // The normal sink also carries the tool-noise fallback: when the filter
+    // flags a body as provider tool I/O, the original is written to the
+    // snippet store, summarized, and pushed as a file instead of being
+    // collapsed to one lossy line.
+    const sink = createTurnSink({
+      sender,
+      toUserId: fromUserId,
+      contextToken,
+      cwd: (session.workingDirectory || config.workingDirectory).replace(/^~/, homedir()),
+      model: session.model,
+      abortController,
+      compact: isCompactEnabled(session, config),
+      onAccepted: () => { anySent = true; },
+    });
 
-    function emitText(text: string, role: 'interstitial' | 'final'): void {
-      if (!text.trim()) return;
-
-      // 若上一次发送失败留下了 pendingRetry，先用它原本的 role 单独补发，
-      // 不要和当前 role 的文本合并（避免 interstitial 内容混进 final 答案）。
-      if (pendingRetry) {
-        const stuck = pendingRetry;
-        pendingRetry = null;
-        scheduleSend(stuck.text, stuck.role);
-      }
-
-      scheduleSend(text, role);
-    }
-
-    function scheduleSend(text: string, role: 'interstitial' | 'final'): void {
-      if (!text.trim()) return;
-      flushChain = flushChain.then(async () => {
-        const chunks = splitMessage(text);
-        for (let i = 0; i < chunks.length; i++) {
-          try {
-            await sender.sendText(fromUserId, contextToken, chunks[i]);
-          } catch (err) {
-            pendingRetry = { text: chunks.slice(i).join('\n\n'), role };
-            logger.warn('emitText send failed, content retained for retry', {
-              role,
-              error: err instanceof Error ? err.message : String(err),
-              retainedChunks: chunks.length - i,
-            });
-            return;
-          }
-        }
-        anySent = true;
-        lastSentTime = Date.now();
-      });
-    }
-
-    const router = new TurnRouter((msg) => emitText(filterToolNoise(msg.text), msg.role));
-
-    // Safety net: send keepalive if nothing was sent for 5 minutes
-    const SILENCE_WARNING_MS = 5 * 60 * 1000;
-    const SILENCE_MESSAGES = [
-      '我还在处理中，这个问题有点复杂，请再稍等一下',
-      '正在努力干活中，马上就有结果了，请稍等片刻',
-      '有点复杂正在处理，再给我一点时间，很快就好',
-      '快好了别着急，正在收尾阶段，马上给你回复',
-      '还在跑呢，任务量比较大，不过马上就能出结果了',
-      '任务比想象的复杂一些，再等等我，正在全力处理',
-      '正在处理中，进展顺利，再等一会儿就好',
-      '还没完不过已经快了，再给我一分钟就能搞定',
-      '我在认真思考这个问题，请再稍等一会儿',
-      '稍微有点棘手，不过已经快解决了，再等我一下',
-    ];
-    flushTimer = setInterval(() => {
-      if (Date.now() - lastSentTime > SILENCE_WARNING_MS) {
-        const msg = SILENCE_MESSAGES[Math.floor(Math.random() * SILENCE_MESSAGES.length)];
-        sender.sendText(fromUserId, contextToken, msg).catch(() => {});
-        lastSentTime = Date.now();
-      }
-    }, 2000);
+    const router = new TurnRouter((msg) => sink.emit(msg.text, msg.role));
 
     const queryOptions: QueryOptions = {
       prompt,
@@ -655,6 +807,12 @@ async function sendToClaude(
       },
     };
 
+
+    // Measured across the query (and its resume-failed retry), because the
+    // compact path asks "was this turn short *and* quick?" — a turn that
+    // took 40 seconds to produce four messages is worth compacting even
+    // though four messages would fit in the budget.
+    const startedAt = Date.now();
     let result = await claudeQuery(queryOptions);
 
     // If resume failed (e.g. corrupted session), retry without resume
@@ -666,6 +824,7 @@ async function sendToClaude(
       const retryResult = await claudeQuery(queryOptions);
       Object.assign(result, retryResult);
     }
+    const elapsedMs = Date.now() - startedAt;
 
     // Stop periodic flush, drain router (final 先于 interstitial). Per-user
     // worker in sender keeps running until the queue drains — no need to
@@ -679,18 +838,26 @@ async function sendToClaude(
         logger.warn('Claude query had error but returned text, using text', { error: result.error });
       }
       sessionStore.addChatMessage(session, 'assistant', result.text);
-      // If nothing was streamed at all (e.g. streaming not supported), send full text now
-      if (!anySent) {
-        const chunks = splitMessage(result.text);
-        for (const chunk of chunks) {
-          await sender.sendText(fromUserId, contextToken, chunk);
-        }
+    }
+
+    // The sink owns delivery. It knows whether anything was streamed, and
+    // whether the turn has to be compacted instead of sent as-is:
+    //   - normal sink: nothing streamed → send the full text
+    //   - compact sink: short and quick → send the blocks in order
+    //                   long or slow   → write a file, summarize, attach
+    await sink.deliver({
+      finalText: result.text,
+      elapsedMs,
+      aborted: abortController.signal.aborted,
+    });
+
+    if (!result.text) {
+      if (result.error) {
+        logger.error('Claude query error', { error: result.error });
+        sender.enqueue(fromUserId, contextToken, 'Claude 处理请求时出错，请稍后重试。', 'final');
+      } else if (!anySent) {
+        sender.enqueue(fromUserId, contextToken, 'Claude 无返回内容（可能因权限被拒而终止）', 'final');
       }
-    } else if (result.error) {
-      logger.error('Claude query error', { error: result.error });
-      await sender.sendText(fromUserId, contextToken, 'Claude 处理请求时出错，请稍后重试。');
-    } else if (!anySent) {
-      await sender.sendText(fromUserId, contextToken, 'Claude 无返回内容（可能因权限被拒而终止）');
     }
 
     // Update session with new SDK session ID
