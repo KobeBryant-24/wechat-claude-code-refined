@@ -23,6 +23,71 @@ export interface Session {
   chatHistory: ChatMessage[];
   maxHistoryLength?: number;
   /**
+   * The most recent user message that was handed to sendToClaude, regardless
+   * of whether the turn completed or was interrupted. Persisted forever (not
+   * cleared on success) so a fresh daemon can hand it to Claude as part of
+   * the startup auto-resume JSON prompt. Lets the model decide — based on the
+   * full JSONL tail — whether to send the user a recovery message after a
+   * redeploy/restart cycle.
+   */
+  lastUserQuery?: string;
+  /**
+   * Wall-clock timestamp (ms) of the most recent startup auto-resume
+   * consultation that resulted in a `notify` (or `silent`) decision. Used to
+   * suppress redundant consultations on tight restart loops: if the daemon
+   * crashes and watchdog restarts it 5 times in 30s, we shouldn't run 5
+   * Claude calls producing 5 potentially-duplicate "interrupted turn"
+   * messages. Cooldown is 60s.
+   *
+   * Cleared when a new user message arrives (handleMessage path) so the next
+   * restart after a fresh turn is allowed to consult again.
+   */
+  lastConsultedAt?: number;
+  /**
+   * Wall-clock timestamp (ms) when the most recent user query was dispatched
+   * to `sendToClaude`. Used by the consultation safety guard to refuse
+   * auto-resume when the user's message landed < 5s before the bridge died
+   * (suggests the user is still actively testing / hasn't disengaged from
+   * the keyboard).
+   */
+  lastUserQueryAt?: number;
+  /**
+   * Wall-clock timestamp (ms) when the singleton-lock reaper killed a
+   * previous main.js during this startup. Indicates the prior instance died
+   * in a way the wrapper didn't notice (SIGKILL, TerminateProcess) and the
+   * bridge was already in a crash loop. Auto-resume is refused in this
+   * window so we don't pile a Claude call on top of an unstable service.
+   */
+  lastOrphanReapAt?: number;
+  /**
+   * Set when a turn starts, cleared when it finishes cleanly. Survives a crash
+   * because the session file is written before the SDK query starts, so a
+   * fresh daemon can tell "the previous process died mid-turn" as a *fact*
+   * instead of inferring it from a transcript whose last tool_use has no
+   * matching tool_result.
+   */
+  pendingTurn?: {
+    /** The user text this turn was answering (possibly truncated). */
+    query: string;
+    /** Wall-clock ms when the turn was dispatched. */
+    startedAt: number;
+  };
+  /**
+   * The command of the last tool_use that never received a tool_result, i.e.
+   * the command the dying process was executing when it was killed. For a
+   * `npm run redeploy` this is the deploy itself — which *did* run to
+   * completion; it just never got to report back.
+   */
+  interruptedCommand?: string;
+  /**
+   * How many times auto-resume has fired for this session, and when it last
+   * did. A deploy-triggered restart re-enters the consultation on every
+   * spawn, so without a counter a misjudged decision can loop forever: fire
+   * resume → agent redoes the deploy → process restarts → consult again.
+   */
+  autoResumeCount?: number;
+  lastAutoResumeAt?: number;
+  /**
    * Whether this session collects a turn's output and delivers it as one
    * unit instead of streaming it piece by piece.
    *
