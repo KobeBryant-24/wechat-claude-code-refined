@@ -740,6 +740,7 @@ async function runDaemon(): Promise<void> {
 
   const callbacks: MonitorCallbacks = {
     onMessage: async (msg: WeixinMessage) => {
+      logger.info('onMessage entered', { message_id: msg.message_id, message_type: msg.message_type, from: msg.from_user_id, has_items: !!msg.item_list });
       if (handlePriorityCommand(msg)) return;
       messageQueue.push(msg);
       drainQueue();
@@ -839,10 +840,20 @@ async function handleMessage(
   messageQueue: WeixinMessage[],
   sessionWatcher: ReturnType<typeof createSessionWatcher>,
 ): Promise<void> {
+  logger.info('handleMessage entered', { message_id: msg.message_id, message_type: msg.message_type, from: msg.from_user_id });
   // Filter: only user messages with required fields
-  if (msg.message_type !== MessageType.USER) return;
-  if (!msg.from_user_id || !msg.item_list) return;
-  if (account.userId && msg.from_user_id !== account.userId) return;
+  if (msg.message_type !== MessageType.USER) {
+    logger.warn('handleMessage skipped: not USER message_type', { message_type: msg.message_type });
+    return;
+  }
+  if (!msg.from_user_id || !msg.item_list) {
+    logger.warn('handleMessage skipped: missing from_user_id or item_list', { from_user_id: msg.from_user_id, has_items: !!msg.item_list });
+    return;
+  }
+  if (account.userId && msg.from_user_id !== account.userId) {
+    logger.warn('handleMessage skipped: from_user_id mismatch', { expected: account.userId, got: msg.from_user_id });
+    return;
+  }
 
   const contextToken = msg.context_token ?? '';
   const fromUserId = msg.from_user_id;
