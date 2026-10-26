@@ -15,6 +15,7 @@ import { createSessionStore, type Session } from './session.js';
 import { routeCommand, type CommandContext, type CommandResult } from './commands/router.js';
 import { claudeQuery, type QueryOptions } from './claude/provider.js';
 import { TurnRouter } from './claude/turn-router.js';
+import { cleanupExpiredSnippets } from './claude/snippet-store.js';
 import { filterToolNoise } from './claude/tool-noise-filter.js';
 import { loadConfig, saveConfig } from './config.js';
 import { logger } from './logger.js';
@@ -346,6 +347,18 @@ async function runDaemon(): Promise<void> {
     process.exit(0);
   }
 
+  // Sweep snippets past their 7-day retention. Best-effort: a stale directory
+  // must never keep the daemon from starting.
+  try {
+    const swept = cleanupExpiredSnippets();
+    if (swept > 0) {
+      logger.info('Snippet cleanup: removed expired snippets', { removed: swept });
+    }
+  } catch (err) {
+    logger.warn('Snippet cleanup failed', {
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
 

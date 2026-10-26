@@ -43,10 +43,31 @@ function extractTail(text: string): string {
  * 任一不满足即原样返回。
  */
 export function filterToolNoise(text: string): string {
-  if (text.length <= LENGTH_THRESHOLD) return text;
-  if (!FENCED_JSON.test(text)) return text;
-  if (!URL_OR_PATH.test(text)) return text;
+  const v = classifyToolNoise(text);
+  if (!v.hit) return text;
+  return v.tail ? `🔧 [工具调用] — ${v.tail}` : '🔧 [工具调用]';
+}
 
-  const tail = extractTail(text);
-  return tail ? `🔧 [工具调用] — ${tail}` : '🔧 [工具调用]';
+/**
+ * Pure verdict of the same three-condition test, without doing any formatting.
+ *
+ * `filterToolNoise` collapses a hit to a single line, which loses everything
+ * above the last structural line — empirically a 2539-char answer became 49
+ * chars, silently, with no way back. Callers that need the content preserved
+ * should branch on this instead: store the original somewhere retrievable,
+ * send a short stand-in, and let the user pull the full text on demand.
+ */
+export interface ToolNoiseVerdict {
+  hit: boolean;
+  /** Prose found after the last structural line. Empty when hit with no tail. */
+  tail: string;
+  textLength: number;
+}
+
+export function classifyToolNoise(text: string): ToolNoiseVerdict {
+  const len = text.length;
+  if (len <= LENGTH_THRESHOLD) return { hit: false, tail: '', textLength: len };
+  if (!FENCED_JSON.test(text)) return { hit: false, tail: '', textLength: len };
+  if (!URL_OR_PATH.test(text)) return { hit: false, tail: '', textLength: len };
+  return { hit: true, tail: extractTail(text), textLength: len };
 }

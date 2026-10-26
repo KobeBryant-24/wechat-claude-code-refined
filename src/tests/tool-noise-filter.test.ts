@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { filterToolNoise } from '../claude/tool-noise-filter.js';
+import { filterToolNoise, classifyToolNoise } from '../claude/tool-noise-filter.js';
 
 // 测试跑在 dist/tests/，但 fixture JSON 不会被 tsc 复制——直接从 src/ 读。
 const fixturePath = join(process.cwd(), 'src', 'tests', 'fixtures', 'tool-noise', 'real-cases.json');
@@ -91,4 +91,50 @@ test('命中但没有可提取尾巴：返回中性占位', () => {
   const padded = text + ' '.repeat(420 - text.length);
   const got = filterToolNoise(padded);
   assert.equal(got, '🔧 [工具调用]');
+});
+
+// --- classifyToolNoise -------------------------------------------------------
+//
+// The recovery path branches on the verdict rather than on the collapsed
+// string, so the verdict has to agree with filterToolNoise on every input —
+// and it has to report enough for the caller to keep the original.
+
+test('classifyToolNoise agrees with filterToolNoise on hit/miss', () => {
+  const hit = ['```json', '{"imageSource":"https://example.com/a.png"}', '```', '收尾说明'].join('\n')
+    + ' '.repeat(420);
+  const miss = '短消息，直接放行';
+
+  for (const input of [hit, miss]) {
+    const verdict = classifyToolNoise(input);
+    const collapsed = filterToolNoise(input);
+    const collapsedHit = collapsed !== input;
+    assert.equal(verdict.hit, collapsedHit, `disagreement on: ${input.slice(0, 60)}`);
+  }
+});
+
+test('classifyToolNoise reports textLength and the extracted tail', () => {
+  const tail = '这是收尾的旁白';
+  const text = ['```json', '{"a":"https://example.com"}', '```', tail].join('\n')
+    + ' '.repeat(420);
+
+  const verdict = classifyToolNoise(text);
+  assert.equal(verdict.hit, true);
+  assert.equal(verdict.textLength, text.length);
+  assert.equal(verdict.tail, tail);
+});
+
+test('classifyToolNoise preserves enough info for the caller to keep the original', () => {
+  // The recovery path writes `text` verbatim to the snippet store, so the
+  // verdict must not be lossy itself — same length in, same length reported,
+  // and the untruncated source is still available to the caller.
+  const text = ['```json', '{"a":"https://example.com"}', '```', 'tail'].join('\n')
+    + ' '.repeat(420);
+  const before = text.length;
+
+  const verdict = classifyToolNoise(text);
+  assert.equal(verdict.hit, true);
+  assert.equal(verdict.textLength, before);
+  // The original is untouched and still full length — the caller keeps it.
+  assert.equal(text.length, before);
+  assert.ok(text.includes('```json'));
 });

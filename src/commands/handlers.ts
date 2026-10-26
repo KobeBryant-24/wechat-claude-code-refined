@@ -2,6 +2,7 @@ import type { CommandContext, CommandResult } from './router.js';
 import { scanAllSkills, formatSkillList, findSkill, type SkillInfo } from '../claude/skill-scanner.js';
 import { loadConfig, saveConfig } from '../config.js';
 import { DEFAULT_WORKING_DIR } from '../constants.js';
+import { readSnippet, snippetPath, isValidSnippetId } from '../claude/snippet-store.js';
 import { readFileSync, existsSync, statSync } from 'node:fs';
 import { resolve, basename, join } from 'node:path';
 import { homedir } from 'node:os';
@@ -21,6 +22,7 @@ const HELP_TEXT = `可用命令：
 
 文件：
   /send <路径>      发送本地文件（图片直接显示，其他文件作为附件）
+  /show <编号>     重新获取被压缩消息的完整原文（7 天内有效）
 
 配置：
   /cwd [路径]       查看或切换工作目录
@@ -204,6 +206,47 @@ export function handlePrompt(_ctx: CommandContext, args: string): CommandResult 
   config.systemPrompt = args.trim();
   saveConfig(config);
   return { reply: `✅ 系统提示词已设置:\n${config.systemPrompt}`, handled: true };
+}
+
+/**
+ * Re-send a message body that the tool-noise filter compressed away.
+ *
+ * Every compressed body is stored under `~/.wechat-claude-code/snippets/<id>.md`
+ * for a week, and its id is printed in the compressed message. This is the
+ * escape hatch: the user can always get the original back.
+ *
+ * The id comes straight from a WeChat message and is joined onto a filesystem
+ * path, so `isValidSnippetId` (8 lowercase hex chars) gates it — `../../` and
+ * absolute paths never reach `join`.
+ */
+export function handleShow(_ctx: CommandContext, args: string): CommandResult {
+  const id = args.trim().toLowerCase();
+
+  if (!id) {
+    return {
+      reply: '用法: /show <编号>\n例: /show a1b2c3d4\n（编号见被压缩消息里的「编号 xxxxxxxx」）',
+      handled: true,
+    };
+  }
+
+  if (!isValidSnippetId(id)) {
+    return { reply: `编号格式不对: ${id}\n应是 8 位十六进制字母数字（a-f 和 0-9）。`, handled: true };
+  }
+
+  const text = readSnippet(id);
+  if (text === undefined) {
+    return {
+      reply: `找不到编号 ${id}\n可能已被清理（保留 7 天），或者编号输错了。`,
+      handled: true,
+    };
+  }
+
+  return {
+    reply: `📄 编号 ${id} 的完整原文（${text.length} 字）：`,
+    sendFile: snippetPath(id)!,
+    handled: true,
+    priority: true,
+  };
 }
 
 export function handleSend(ctx: CommandContext, args: string): CommandResult {
