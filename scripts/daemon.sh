@@ -6,9 +6,49 @@ set -euo pipefail
 # Supports: macOS (launchd) / Linux (systemd + nohup fallback)
 # =============================================================================
 
-DATA_DIR="${HOME}/.wechat-claude-code"
+DATA_DIR="${WCC_DATA_DIR:-${HOME}/.wechat-claude-code}"
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 SERVICE_NAME="wechat-claude-code"
+
+# Path variables that must reach the daemon so it and the Claude Code CLI it
+# spawns resolve the same directories as the user's own shell. Both are
+# optional — unset means "use the default" (~/.claude and
+# ~/.wechat-claude-code respectively).
+#
+# Note: ANTHROPIC_* / CLAUDE_API_KEY are still propagated below. They are
+# *not* needed when the CLI reads its credentials from ~/.claude/settings.json
+# (the Windows service works that way with zero credential env vars), but on
+# macOS/Linux the daemon inherits nothing from the login shell, so dropping
+# them would lock out users whose only credential source is a shell variable.
+# They live in ~/Library/LaunchAgents and ~/.config/systemd/user — never in
+# the repo — so unlike the Windows wrapper XML they can't leak into git.
+
+# Escape a value for embedding in XML text.
+xml_escape() {
+  printf '%s' "${1:-}" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
+}
+
+# Emit `<key>K</key><string>V</string>` lines for a launchd plist.
+plist_path_env() {
+  local var value
+  for var in CLAUDE_CONFIG_DIR WCC_DATA_DIR; do
+    value="${!var:-}"
+    [ -z "$value" ] && continue
+    printf '    <key>%s</key>\n    <string>%s</string>\n' "$var" "$(xml_escape "$value")"
+  done
+  return 0
+}
+
+# Emit `Environment="K=V"` lines for a systemd unit.
+systemd_path_env() {
+  local var value
+  for var in CLAUDE_CONFIG_DIR WCC_DATA_DIR; do
+    value="${!var:-}"
+    [ -z "$value" ] && continue
+    printf 'Environment="%s=%s"\n' "$var" "$value"
+  done
+  return 0
+}
 
 # Platform detection
 OS_TYPE="$(uname -s)"
@@ -50,6 +90,9 @@ macos_start() {
 "
     fi
   done
+  # ... plus the path variables, so the daemon and the CLI it spawns look in
+  # the same places the user's shell does.
+  plist_extra_env="${plist_extra_env}$(plist_path_env)"
 
   cat > "$plist_path" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -181,6 +224,9 @@ linux_create_service_file() {
 "
     fi
   done
+  # ... plus the path variables, so the daemon and the CLI it spawns look in
+  # the same places the user's shell does.
+  extra_env="${extra_env}$(systemd_path_env)"
 
   cat > "$service_file" <<SERVICE
 [Unit]

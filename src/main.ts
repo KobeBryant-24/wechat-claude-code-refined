@@ -5,6 +5,7 @@ import { join, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { unlinkSync, writeFileSync, mkdirSync, statSync, openSync, readSync, closeSync, existsSync, readdirSync, readFileSync, appendFileSync } from 'node:fs';
 import { homedir } from 'node:os';
+import { claudeProjectsDir, refreshInstallState } from './paths.js';
 
 import { WeChatApi } from './wechat/api.js';
 import { saveAccount, loadLatestAccount, type AccountData } from './wechat/accounts.js';
@@ -156,7 +157,7 @@ function encodeProjectDir(cwd: string): string {
  * `findSdkSessionPath` from commands/handlers.ts.
  */
 function findSdkSessionPath(sessionId: string, cwd: string): string | undefined {
-  const projectsDir = join(homedir(), '.claude', 'projects');
+  const projectsDir = claudeProjectsDir();
   if (!existsSync(projectsDir)) return undefined;
   const exact = join(projectsDir, encodeProjectDir(cwd), `${sessionId}.jsonl`);
   if (existsSync(exact)) return exact;
@@ -594,6 +595,13 @@ async function runDaemon(): Promise<void> {
 
   const config = loadConfig();
   const account = loadLatestAccount();
+
+  // Record where this build actually runs from. The skill doc lives in the
+  // Claude global dir, not in this checkout, so it needs a way to find the
+  // run directory — this is that way. The install script writes the same
+  // file; refreshing here keeps it honest if the checkout ever moves.
+  const install = refreshInstallState();
+  logger.info('Install state refreshed', { projectDir: install.projectDir });
 
   if (!account) {
     console.error('未找到账号，请先运行 node dist/main.js setup');

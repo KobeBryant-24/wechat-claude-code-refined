@@ -1,7 +1,7 @@
-import { readdirSync, readFileSync, existsSync, type Dirent } from 'node:fs';
+import { readdirSync, readFileSync, existsSync, statSync, type Dirent } from 'node:fs';
 import { join } from 'node:path';
-import { homedir } from 'node:os';
 import { logger } from '../logger.js';
+import { claudeConfigDir, claudeSkillsDir } from '../paths.js';
 
 export interface SkillInfo {
   name: string;
@@ -58,8 +58,24 @@ function scanDirectory(baseDir: string, depth: number = 2): SkillInfo[] {
   }
 
   for (const entry of entries) {
-    if (!entry.isDirectory()) continue;
     const fullPath = join(baseDir, entry.name);
+
+    // 早期版本把旧安装的备份留在 skills/ 下面（*.bak-*），那不是 skill。
+    // 新版安装脚本会把它们挪到 <claudeDir>/skill-backups/，这里只是兜底。
+    if (entry.name.includes('.bak-')) continue;
+
+    // 目录联接 / 符号链接：readdir 的 Dirent 不跟随链接，isDirectory() 对
+    // 链接返回 false，必须 stat 一次才知道它是不是目录。skill 正是用目录
+    // 联接装进 <claudeConfigDir>/skills/ 的，不跟随就扫不到它。
+    let isDir = entry.isDirectory();
+    if (!isDir) {
+      try {
+        isDir = statSync(fullPath).isDirectory();
+      } catch {
+        continue; // 断掉的链接
+      }
+    }
+    if (!isDir) continue;
 
     if (depth > 1) {
       // Recurse one level deeper
@@ -81,19 +97,22 @@ function scanDirectory(baseDir: string, depth: number = 2): SkillInfo[] {
 /**
  * Scan all known skill directories for installed Claude Code skills.
  *
+ * `<claudeConfigDir>` is `CLAUDE_CONFIG_DIR` when set, otherwise `~/.claude`.
+ *
  * Locations scanned:
- * 1. ~/.claude/skills/ (each subdirectory)
- * 2. ~/.claude/plugins/cache/{plugin}/skills/ (each subdirectory)
- * 3. ~/.claude/plugins/cache/{plugin}/superpowers/skills/ (each subdirectory)
+ * 1. <claudeConfigDir>/skills/ (each subdirectory)
+ * 2. <claudeConfigDir>/plugins/cache/{plugin}/skills/ (each subdirectory)
+ * 3. <claudeConfigDir>/plugins/cache/{plugin}/superpowers/skills/ (each subdirectory)
+ *
+ * Directory junctions / symlinks are followed — see scanDirectory.
  */
 export function scanAllSkills(): SkillInfo[] {
-  const home = homedir();
-  const claudeDir = join(home, '.claude');
+  const claudeDir = claudeConfigDir();
   const skills: SkillInfo[] = [];
   const seen = new Set<string>();
 
-  // 1. ~/.claude/skills/*/
-  const userSkillsDir = join(claudeDir, 'skills');
+  // 1. <claudeConfigDir>/skills/*/
+  const userSkillsDir = claudeSkillsDir();
   for (const skill of scanDirectory(userSkillsDir, 1)) {
     if (!seen.has(skill.name)) {
       seen.add(skill.name);
@@ -112,7 +131,17 @@ export function scanAllSkills(): SkillInfo[] {
     }
 
     for (const cacheEntry of cacheEntries) {
-      if (!cacheEntry.isDirectory()) continue;
+      // A plugin cache dir can itself be a junction (plugins installed by
+      // link), and readdir's Dirent reports links as non-directories.
+      let isDir = cacheEntry.isDirectory();
+      if (!isDir) {
+        try {
+          isDir = statSync(join(pluginsCacheDir, cacheEntry.name)).isDirectory();
+        } catch {
+          continue;
+        }
+      }
+      if (!isDir) continue;
       const cacheDir = join(pluginsCacheDir, cacheEntry.name);
 
       // Regular skills

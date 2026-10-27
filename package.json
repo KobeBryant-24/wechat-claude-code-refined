@@ -11,6 +11,7 @@
     "dev": "tsc --watch",
     "test": "node --test dist/tests/*.test.js",
     "setup": "node dist/main.js setup",
+    "skill:install": "node scripts/install-skill.mjs",
     "daemon": "bash scripts/daemon.sh",
     "daemon:reinstall": "node scripts/windows-service.cjs reinstall",
     "daemon:restart": "node scripts/windows-service.cjs restart",

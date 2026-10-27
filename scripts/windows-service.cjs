@@ -29,7 +29,10 @@ const { Service } = require('node-windows');
 // Resolve paths from this script's location so the script works regardless
 // of the current working directory it is invoked from.
 const PROJECT_DIR = path.resolve(__dirname, '..');
-const DATA_DIR = path.join(os.homedir(), '.wechat-claude-code');
+// Data dir resolution must match src/constants.ts exactly, otherwise the
+// service writes logs/tokens to one place while the app reads accounts and
+// config from another.
+const DATA_DIR = process.env.WCC_DATA_DIR || path.join(os.homedir(), '.wechat-claude-code');
 const LOG_DIR = path.join(DATA_DIR, 'logs');
 const WATCHDOG_TOKEN_FILE = path.join(DATA_DIR, 'watchdog-v2.token');
 const WATCHDOG_HTTP_PORT = parseInt(process.env.WCC_WATCHDOG_PORT || '9921', 10);
@@ -191,6 +194,18 @@ function buildBaseEnv() {
   // No USERDOMAIN / USERNAME here. Nothing in src/ reads them (os.userInfo()
   // on Windows reads the process token, not the env var), and pinning them
   // would bake this machine's account name into the service config.
+
+  // Path (not secret) variables that must survive into the service, so the
+  // daemon and the Claude Code CLI it spawns resolve the same directories as
+  // the user's own shell. Both are optional: when unset, the CLI falls back
+  // to ~/.claude (which USERPROFILE above already points at the right
+  // place) and the app falls back to ~/.wechat-claude-code.
+  if (process.env.CLAUDE_CONFIG_DIR) {
+    env.push({ name: 'CLAUDE_CONFIG_DIR', value: process.env.CLAUDE_CONFIG_DIR });
+  }
+  if (process.env.WCC_DATA_DIR) {
+    env.push({ name: 'WCC_DATA_DIR', value: process.env.WCC_DATA_DIR });
+  }
   return env;
 }
 

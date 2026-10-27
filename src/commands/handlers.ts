@@ -2,6 +2,7 @@ import type { CommandContext, CommandResult } from './router.js';
 import { scanAllSkills, formatSkillList, findSkill, type SkillInfo } from '../claude/skill-scanner.js';
 import { loadConfig, saveConfig } from '../config.js';
 import { DEFAULT_WORKING_DIR } from '../constants.js';
+import { claudeProjectsDir } from '../paths.js';
 import { readSnippet, snippetPath, isValidSnippetId } from '../claude/snippet-store.js';
 import { shortSessionId } from '../claude/session-watcher.js';
 import { readFileSync, existsSync, statSync, readdirSync, openSync, readSync, closeSync } from 'node:fs';
@@ -222,7 +223,7 @@ type SessionLookup =
  * on every turn while the state table claimed a resume was configured.
  */
 function findSessionFile(id: string): SessionLookup {
-  const projectsDir = join(homedir(), '.claude', 'projects');
+  const projectsDir = claudeProjectsDir();
   if (!existsSync(projectsDir)) return { kind: 'missing' };
 
   let projectDirs: string[];
@@ -404,8 +405,7 @@ function decodeProjectDirName(encoded: string): string {
 }
 
 function listSdkSessions(ctx: CommandContext): string {
-  const home = homedir();
-  const projectsDir = join(home, '.claude', 'projects');
+  const projectsDir = claudeProjectsDir();
   if (!existsSync(projectsDir)) {
     return `📂 找不到 ${projectsDir}\n请先在 Claude Code 终端跑过一次对话以生成会话文件。`;
   }
@@ -640,7 +640,7 @@ function encodeProjectDir(cwd: string): string {
 }
 
 function findSdkSessionPath(sessionId: string, cwd: string): string | undefined {
-  const projectsDir = join(homedir(), '.claude', 'projects');
+  const projectsDir = claudeProjectsDir();
   if (!existsSync(projectsDir)) return undefined;
   // Exact match first (fast path).
   const exact = join(projectsDir, encodeProjectDir(cwd), `${sessionId}.jsonl`);

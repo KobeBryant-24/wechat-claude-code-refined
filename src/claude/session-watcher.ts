@@ -27,8 +27,8 @@
 
 import { openSync, readSync, closeSync, fstatSync, existsSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { homedir } from 'node:os';
 import { DATA_DIR } from '../constants.js';
+import { claudeProjectsDir } from '../paths.js';
 import { loadJson, saveJson } from '../store.js';
 import { logger } from '../logger.js';
 
@@ -356,7 +356,7 @@ export function resolveSessionTranscript(
   sessionId: string,
   projectsDir?: string,
 ): string | undefined {
-  const root = projectsDir ?? join(homedir(), '.claude', 'projects');
+  const root = projectsDir ?? claudeProjectsDir();
   if (!existsSync(root)) return undefined;
 
   let projectDirs: string[];

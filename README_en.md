@@ -29,27 +29,42 @@ Scan a QR code to bind your WeChat, and a new "friend" appears in your contacts.
 
 ## Install
 
-**Option 1: skills CLI (recommended)**
+Code and skill docs live in two separate places:
+
+| | Where | What |
+|---|---|---|
+| **Runtime dir** | wherever you cloned the code | source, `dist/` (build output), `node_modules/` (deps), the daemon |
+| **Skill dir** | `~/.claude/skills/wechat-claude-code/` | docs only, via a **directory junction** pointing at the runtime dir's `skill/` |
+
+> The Claude global dir can be changed with the `CLAUDE_CONFIG_DIR` env var; it defaults to `~/.claude`.
+> The skill dir therefore contains no runnable code, and doc edits take effect immediately.
 
 ```bash
-npx skills add Wechat-ggGitHub/wechat-claude-code
+# 1. clone the code wherever you want it (e.g. ~/wechat-claude-code)
+git clone https://github.com/KobeBryant-24/wechat-claude-code-refined.git ~/wechat-claude-code
+cd ~/wechat-claude-code && npm install
+
+# 2. bind WeChat by scanning a QR code
+npm run setup
+
+# 3. install the skill into Claude's global dir
+npm run skill:install
+
+# 4. register the daemon (auto-start on boot, auto-restart on crash)
+npm run daemon -- start        # macOS / Linux — this writes the launchd / systemd config and starts it
+npm run daemon:reinstall       # Windows (Administrator Git Bash)
 ```
 
-The first time you trigger the skill, it will automatically clone the source and install dependencies.
+Step 3 records the runtime dir in `~/.wechat-claude-code/install.json`, which is how the skill docs know where to run commands.
 
-**Option 2: Manual clone**
-
-```bash
-git clone https://github.com/Wechat-ggGitHub/wechat-claude-code.git ~/.claude/skills/wechat-claude-code
-cd ~/.claude/skills/wechat-claude-code && npm install
-```
+> Because the code and the docs are split, the `npx skills add` style install (whole repo into the skills dir) does not apply here — that would mix code and docs together.
 
 ## Quick Start
 
 ### 1. Bind WeChat
 
 ```bash
-cd ~/.claude/skills/wechat-claude-code
+cd <runtime-dir>     # the directory you cloned the code into
 npm run setup
 ```
 
@@ -61,7 +76,7 @@ A QR code will pop up — scan it with WeChat.
 npm run daemon -- start
 ```
 
-On macOS, this registers a launchd agent for auto-start on boot and auto-restart on crash.
+On macOS this registers a launchd agent, on Linux a systemd user unit — auto-start on boot, auto-restart on crash. On Windows, use `npm run daemon:reinstall` (admin rights required).
 
 ### 3. Start chatting
 
@@ -121,7 +136,7 @@ The daemon long-polls WeChat for new messages, forwards them to the local `claud
 ## Prerequisites
 
 - Node.js >= 18
-- macOS or Linux
+- macOS / Linux / Windows
 - A personal WeChat account
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI installed and authenticated
 
@@ -129,13 +144,14 @@ The daemon long-polls WeChat for new messages, forwards them to the local `claud
 
 ## Data Directory
 
-All data is stored in `~/.wechat-claude-code/`:
+All data is stored in `~/.wechat-claude-code/`, **independent of the runtime dir** (move the code anywhere and your config and accounts come with it):
 
 ```
 ~/.wechat-claude-code/
 ├── accounts/       # WeChat account credentials
 ├── config.json     # Global config
 ├── sessions/       # Session data
+├── install.json    # Where the runtime dir / skill dir live (written by npm run skill:install)
 └── logs/           # Rotating logs (daily, 30-day retention)
 ```
 
