@@ -436,6 +436,24 @@ process.on('SIGTERM', () => shutdownOnSignal('SIGTERM'));
 process.on('SIGINT', () => shutdownOnSignal('SIGINT'));
 process.on('SIGHUP', () => shutdownOnSignal('SIGHUP'));
 
+// The node-windows wrapper stops its child by sending it a 'shutdown' IPC
+// message (that is what `child.send('shutdown')` in its wrapper.js does).
+// Without this handler the message is silently dropped and the service
+// process keeps running after SCM has already marked the service stopped.
+// Treat it exactly like SIGTERM: shut the child down, then exit.
+process.on('message', (msg) => {
+  if (msg === 'shutdown') shutdownOnSignal('SHUTDOWN');
+});
+
+// Safety net for the case where the wrapper dies without getting the chance
+// to send that message (e.g. it is force-killed by SCM). The IPC channel
+// closes when the parent goes away, and an orphaned watchdog would keep
+// holding the WeChat session and the :9921 port. Shutting down here makes
+// "the service stopped" mean the whole chain stopped.
+process.on('disconnect', () => {
+  shutdownOnSignal('PARENT_EXIT');
+});
+
 // -------- bootstrap --------
 
 server.listen(HTTP_PORT, HTTP_HOST, () => {

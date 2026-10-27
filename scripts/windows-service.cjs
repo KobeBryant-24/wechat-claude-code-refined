@@ -83,17 +83,19 @@ const WATCHDOG_SCM_NAME = 'wechatclaudecodewatchdog.exe';
 const WATCHDOG_DISPLAY_NAME = 'WeChat Claude Code Watchdog';
 const WATCHDOG_SCRIPT = path.join(PROJECT_DIR, 'scripts', 'watchdog.cjs');
 
-// Environment variables from the current shell that should propagate to the
-// main bridge service (not the watchdog). ANTHROPIC_* and CLAUDE_API_KEY are
-// needed for the daemon to authenticate against Anthropic. PATH is rebuilt
-// using the current PATH plus the directory containing node.exe so that the
-// service can find spawned tools.
-const PROPAGATED_ENV_VARS = [
-  'ANTHROPIC_AUTH_TOKEN',
-  'ANTHROPIC_API_KEY',
-  'ANTHROPIC_BASE_URL',
-  'CLAUDE_API_KEY',
-];
+// No credential env vars are propagated into the service.
+//
+// The bridge never talks to Anthropic itself: it spawns the Claude Code CLI
+// (`claude -p ...`) once per WeChat message, and the CLI resolves its own
+// credentials from ~/.claude/settings.json (the `env` block) or from the
+// user's own shell environment. Propagating ANTHROPIC_AUTH_TOKEN here would
+// only write the secret in clear text into the generated wrapper XML and
+// into the SCM registry — which is exactly how a token ended up in this
+// repository's git history before.
+//
+// Consequence: rotating the token is an edit to ~/.claude/settings.json.
+// It takes effect on the next WeChat message — the daemon spawns a fresh
+// `claude` per message — with no service reinstall.
 
 // --- SCM (Service Control Manager) queries ---------------------------------
 
@@ -139,6 +141,10 @@ function buildBaseEnv() {
   fs.mkdirSync(LOG_DIR, { recursive: true });
   const nodeDir = path.dirname(process.execPath);
   const basePath = process.env.PATH || '';
+  // The installing user's home directory. Everything below is derived from
+  // it or from PROJECT_DIR — never a hardcoded absolute path, so that a
+  // fresh `git clone` on another machine installs a working service.
+  const userHome = os.homedir();
   // PATH entries the service must have to find user-installed tools. The
   // service runs as LocalSystem, whose default PATH does NOT include any
   // user-installed binaries. Missing `claude` from PATH causes main.js to
@@ -149,9 +155,9 @@ function buildBaseEnv() {
   // is added only if not already present.
   const requiredDirs = [
     nodeDir,
-    'C:\\Users\\Administrator\\AppData\\Roaming\\npm',       // npm-global bins (claude.cmd etc.)
-    'C:\\Users\\Administrator\\.local\\bin',                 // Claude Code install location (claude.exe)
-    'C:\\Users\\Administrator\\.claude\\skills\\wechat-claude-code\\node_modules\\.bin',
+    path.join(userHome, 'AppData', 'Roaming', 'npm'),  // npm-global bins (claude.cmd etc.)
+    path.join(userHome, '.local', 'bin'),               // Claude Code install location (claude.exe)
+    path.join(PROJECT_DIR, 'node_modules', '.bin'),     // this checkout's local bins
   ];
   const existing = basePath.split(path.delimiter);
   const merged = [...requiredDirs.filter((d) => d && !existing.includes(d)), ...existing]
@@ -164,7 +170,6 @@ function buildBaseEnv() {
   // `npm run setup` (running as the user) wrote the account credentials.
   // Setting these here makes Node.js inside the service resolve the same
   // data directory as the user, so saved accounts and config are found.
-  const userHome = os.homedir();
   env.push({ name: 'USERPROFILE', value: userHome });
   env.push({ name: 'HOME', value: userHome });
   // APPDATA / LOCALAPPDATA: LocalSystem defaults these to
@@ -179,24 +184,17 @@ function buildBaseEnv() {
   //
   // Pin APPDATA / LOCALAPPDATA / TEMP / TMP to the user-relative paths so
   // claude.exe's native bindings see a single coherent %USERPROFILE%.
-  env.push({ name: 'APPDATA',     value: `${userHome}\\AppData\\Roaming` });
-  env.push({ name: 'LOCALAPPDATA', value: `${userHome}\\AppData\\Local` });
-  env.push({ name: 'TEMP',        value: `${userHome}\\AppData\\Local\\Temp` });
-  env.push({ name: 'TMP',         value: `${userHome}\\AppData\\Local\\Temp` });
-  // USERDOMAIN / USERNAME: a few Win32 APIs (and Node's path.win32 helpers)
-  // reach for %USERDOMAIN% / %USERNAME% when building per-user paths. Setting
-  // them explicitly avoids surprises like `os.userInfo().username === 'SYSTEM'`
-  // leaking into log filenames or sqlite lock names.
-  env.push({ name: 'USERDOMAIN', value: process.env.USERDOMAIN || 'CATCAT' });
-  env.push({ name: 'USERNAME',  value: process.env.USERNAME  || 'Administrator' });
+  env.push({ name: 'APPDATA',     value: path.join(userHome, 'AppData', 'Roaming') });
+  env.push({ name: 'LOCALAPPDATA', value: path.join(userHome, 'AppData', 'Local') });
+  env.push({ name: 'TEMP',        value: path.join(userHome, 'AppData', 'Local', 'Temp') });
+  env.push({ name: 'TMP',         value: path.join(userHome, 'AppData', 'Local', 'Temp') });
+  // No USERDOMAIN / USERNAME here. Nothing in src/ reads them (os.userInfo()
+  // on Windows reads the process token, not the env var), and pinning them
+  // would bake this machine's account name into the service config.
   return env;
 }
 
 function buildService() {
-  const env = buildBaseEnv();
-  for (const name of PROPAGATED_ENV_VARS) {
-    if (process.env[name]) env.push({ name, value: process.env[name] });
-  }
   return new Service({
     name: SERVICE_NAME,
     description: DISPLAY_NAME,
@@ -207,7 +205,7 @@ function buildService() {
     scriptOptions: `--port ${WATCHDOG_HTTP_PORT}`,
     workingDirectory: PROJECT_DIR,
     logpath: LOG_DIR,
-    env,
+    env: buildBaseEnv(),
     wait: 2,
     grow: 0.5,
     // node-windows wrapper translates `maxRetries: N` to `--maxretries N`,
@@ -216,6 +214,17 @@ function buildService() {
     // HTTP API on watchdog-v2 is the recovery mechanism for crashes; SCM
     // FAILURE_ACTIONS covers unexpected wrapper death.
     maxRetries: -1,
+    // node-windows always emits `--stopparentfirst <value>` into the wrapper
+    // arguments, and its wrapper.js treats ANY non-empty string as truthy
+    // (`if (argv.s) child.send('shutdown')`). Leaving this unset renders the
+    // literal string "undefined" into the wrapper XML.
+    //
+    // 'true' is the intended value ("Allow the service to shutdown
+    // cleanly"): winsw gets a valid <stopparentprocessfirst>true</...> and
+    // the wrapper keeps its current semantics (detached child, stopped via
+    // the 'shutdown' IPC message). watchdog-v2 handles that message — see
+    // scripts/watchdog-v2.cjs — so the graceful path now actually runs.
+    stopparentfirst: 'true',
   });
 }
 
@@ -237,6 +246,9 @@ function buildWatchdogService() {
     wait: 2,
     grow: 0,
     maxRetries: 100,
+    // Same reason as the bridge service: keep node-windows from writing
+    // the literal string "undefined" into the watchdog's wrapper XML.
+    stopparentfirst: 'true',
   });
 }
 
