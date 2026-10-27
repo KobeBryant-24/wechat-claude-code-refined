@@ -5,3 +5,10 @@ dist/
 .wechat-claude-code/
 .claude/
 CLAUDE.md
+
+# node-windows 生成的服务包装文件：含本机绝对路径与 ANTHROPIC_AUTH_TOKEN 明文，
+# 是机器本地产物，绝不能进版本库。
+scripts/daemon/*.xml
+scripts/daemon/*.exe.config
+scripts/daemon/*.exe
+scripts/daemon/*.old-*

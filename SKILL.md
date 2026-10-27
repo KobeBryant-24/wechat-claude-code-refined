@@ -7,12 +7,20 @@ description: 微信消息桥接 - 在微信中与 Claude Code 聊天。支持文
 
 通过个人微信与本地 Claude Code 进行对话。
 
+## 运行目录
+
+**`E:\CodeHub\wechat-claude-code-refined`**
+
+这是源码、编译产物（`dist/`）、依赖（`node_modules/`）和守护进程的根目录。**所有构建与运行命令都在这个目录下执行。**换机器时只需改这一行。
+
+skill 目录（`~/.claude/skills/wechat-claude-code/`）只存放本文档，**不含任何运行代码**——源码、编译产物和依赖都在运行目录里。
+
 ## 前置条件
 
 - Node.js >= 18
-- macOS（daemon 使用 launchd 管理）
 - 个人微信账号（需扫码绑定）
 - 已安装 Claude Code（`@anthropic-ai/claude-agent-sdk`）
+- 守护进程由系统服务托管：macOS 用 launchd，Linux 用 systemd，Windows 用 node-windows 服务
 
 ## 安装
 
@@ -27,8 +35,8 @@ npx skills add Wechat-ggGitHub/wechat-claude-code
 **方式二：手动克隆**
 
 ```bash
-git clone https://github.com/Wechat-ggGitHub/wechat-claude-code.git ~/.claude/skills/wechat-claude-code
-cd ~/.claude/skills/wechat-claude-code && npm install
+git clone https://github.com/Wechat-ggGitHub/wechat-claude-code.git <运行目录>
+cd <运行目录> && npm install
 ```
 
 ## 触发场景
@@ -44,22 +52,22 @@ cd ~/.claude/skills/wechat-claude-code && npm install
 ### 第 1 步：检查项目是否完整安装
 
 ```bash
-test -f ~/.claude/skills/wechat-claude-code/package.json && echo "source_ok" || echo "source_missing"
+test -f "<运行目录>/package.json" && echo "source_ok" || echo "source_missing"
 ```
 
 - 如果 `source_missing`：需要从 GitHub 克隆完整项目。执行：
   ```bash
-  git clone https://github.com/Wechat-ggGitHub/wechat-claude-code.git /tmp/wechat-claude-code-install && cp -r /tmp/wechat-claude-code-install/{src,scripts,*.ts,*.json,*.md,LICENSE} ~/.claude/skills/wechat-claude-code/ && rm -rf /tmp/wechat-claude-code-install
+  git clone https://github.com/Wechat-ggGitHub/wechat-claude-code.git /tmp/wechat-claude-code-install && cp -r /tmp/wechat-claude-code-install/{src,scripts,*.ts,*.json,*.md,LICENSE} "<运行目录>/" && rm -rf /tmp/wechat-claude-code-install
   ```
   然后继续检查依赖。
 
 - 如果 `source_ok`：继续检查依赖。
 
 ```bash
-cd ~/.claude/skills/wechat-claude-code && test -d node_modules && echo "deps_ok" || echo "deps_missing"
+cd "<运行目录>" && test -d node_modules && echo "deps_ok" || echo "deps_missing"
 ```
 
-- 如果 `deps_missing`：执行 `cd ~/.claude/skills/wechat-claude-code && npm install` 安装依赖，然后继续。
+- 如果 `deps_missing`：执行 `cd "<运行目录>" && npm install` 安装依赖，然后继续。
 - 如果 `deps_ok`：继续下一步。
 
 ### 第 2 步：检查是否已绑定微信账号
@@ -74,7 +82,7 @@ ls ~/.wechat-claude-code/accounts/*.json 2>/dev/null | head -1
 ### 第 3 步：检查 daemon 运行状态
 
 ```bash
-cd ~/.claude/skills/wechat-claude-code && npm run daemon -- status
+cd "<运行目录>" && npm run daemon -- status
 ```
 
 ### 第 4 步：根据状态展示信息
@@ -114,26 +122,37 @@ cd ~/.claude/skills/wechat-claude-code && npm run daemon -- status
 
 ## 子命令参考
 
-所有命令的工作目录为 `~/.claude/skills/wechat-claude-code`。
+所有命令的工作目录为**运行目录**（见本文开头）。
 
 | 命令 | 执行 | 说明 |
 |------|------|------|
 | setup | `npm run setup` | 首次安装向导：生成 QR 码 → 微信扫码 → 配置工作目录 |
-| start | `npm run daemon -- start` | 启动 launchd 守护进程（开机自启、自动重启） |
+| start | `npm run daemon -- start` | 启动守护进程（开机自启、自动重启） |
 | stop | `npm run daemon -- stop` | 停止守护进程 |
 | restart | `npm run daemon -- restart` | 重启守护进程 |
 | status | `npm run daemon -- status` | 查看运行状态 |
 | logs | `npm run daemon -- logs` | 查看最近日志（tail -100） |
 
+Windows 上守护进程是 node-windows 服务，对应命令：
+
+| 命令 | 执行 |
+|------|------|
+| 安装服务 | `npm run daemon:reinstall` |
+| 重启服务 | `npm run daemon:restart` |
+| 暂停 / 恢复 | `npm run daemon:pause` / `npm run daemon:resume` |
+
+改完代码后用 `npm run redeploy`（= build + daemon:restart）重新部署。
+
 ## 数据目录
 
-所有数据存储在 `~/.wechat-claude-code/`：
+所有数据存储在 `~/.wechat-claude-code/`，**与运行目录无关**：
 
 ```
 ~/.wechat-claude-code/
 ├── accounts/       # 绑定的微信账号数据（每个账号一个 JSON）
-├── config.env      # 全局配置（工作目录、模型、系统提示词）
+├── config.json     # 全局配置（工作目录、模型、系统提示词）
 ├── sessions/       # 会话数据（每个账号一个 JSON）
 ├── get_updates_buf # 消息轮询同步缓冲
-└── logs/           # 运行日志（每日轮转，保留 30 天）
+├── logs/           # 运行日志（每日轮转，保留 30 天）
+└── snippets/       # 长消息落盘的正文片段
 ```
